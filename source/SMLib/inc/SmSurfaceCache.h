@@ -858,6 +858,16 @@ public:
                                                   ///<      :       SM_AD_AUX_OBJECT     (m_pData = (SmBezierAux2d *))       <br>
     ULONG           lRecursionDepth = 0           // (for debugging)                                                         
   );
+
+  // Same result as SubdivideToTolerances(pTree, pTopNode, NULL) for an SM_AD_AUX_DATA top node with a
+  // BSpline subdivision surface. Tolerance tests, node splits and block subdivisions are computed on
+  // worker threads first; the serial recursion then looks them up in its usual order. Callers must
+  // ensure the tests are thread-safe: no view-based driver, no notify callbacks, no surface attributes.
+  SmStatus SubdivideToTolerancesParallel
+  (
+    SmTree        * pTree,                        ///< [in,out]: Tree to modify                                              <br>
+    SmTreeNode    * pTopNode                      ///< [in ]: top node, m_eAuxDataType == SM_AD_AUX_DATA                     <br>
+  );
                                                                   
   // BuildTree helper functions
   SmStatus BuildTreeBase

@@ -42,6 +42,92 @@
 
 #endif
 
+#include <cstring>
+#include <memory>
+#include <unordered_map>
+#include <vector>
+#include <tbb/parallel_for.h>
+#include <tbb/parallel_invoke.h>
+
+/********************************************************************
+   Precomputed refinement results for SubdivideToTolerancesParallel.
+
+   The serial SubdivideToTolerances recursion remains authoritative: it
+   visits nodes depth first, keeps the m_bSwitchToFastSubdivision value a
+   previous node may have left set, and allocates tree nodes in its usual
+   order. Its expensive pure steps (tolerance tests, node splits and block
+   subdivisions) are computed beforehand on worker threads and looked up
+   here. A missing lookup, or one whose inputs differ, falls back to the
+   original computation.
+*********************************************************************/
+namespace {
+
+struct SmRefineBlock
+{
+    SmBoolean                  bEarlyReturn = FALSE;  // SubdivideByBlock returns before building nodes
+    SmTArray<double>           sUSplits;              // splits after culling
+    SmTArray<double>           sVSplits;
+    std::vector<unsigned char> sCellHasPatch;         // per base node, (i-1)*(NumV-1)+(j-1)
+    std::vector<SmExtent3d>    sCellBBox;
+};
+
+struct SmRefineSpec
+{
+    // node state when the serial pass tests it
+    SmExtent2d        sUVDomain;
+    const SmSurface * cpSurface = NULL;
+    SmBoolean         bChordIn  = FALSE;
+    SmBoolean         bAngleIn  = FALSE;
+    SmExtent3d        sBBoxIn;
+
+    // TestAgainstTolerances results
+    SmStatus          eTestStatus = SM_ERR;
+    SmBoolean         bNeedsSub   = FALSE;
+    SmBoolean         bSetFast    = FALSE;           // TestAgainstTolerances set m_bSwitchToFastSubdivision
+    SmSurfParamType   eDir        = SM_SP_U;
+    SmBoolean         bChordOut   = FALSE;
+    SmBoolean         bAngleOut   = FALSE;
+    SmExtent3d        sBBoxOut;
+
+    // SubdivideNode results
+    SmBoolean         bSplit      = FALSE;
+    double            dSplitParam = 0.0;
+    SmSurface       * pChildSurface[2] = {NULL, NULL};  // owned until the serial pass adopts them
+    SmExtent3d        sChildBBox[2];
+    std::unique_ptr<SmRefineSpec> pChild[2];
+
+    // SubdivideByBlock results
+    std::unique_ptr<SmRefineBlock> pBlock;
+
+    ~SmRefineSpec() { delete pChildSurface[0]; delete pChildSurface[1]; }
+};
+
+struct SmRefinePrecompute
+{
+    std::unordered_map<const SmTreeNode *, SmRefineSpec *> sNodeSpecs;
+};
+
+// Captures the fast subdivision switch while worker threads run TestAgainstTolerances
+SM_THREAD_LOCAL SmBoolean          * t_pFastSubdivisionSink = NULL;
+// Lookups for the serial pass of SubdivideToTolerancesParallel
+SM_THREAD_LOCAL SmRefinePrecompute * t_pRefinePrecompute    = NULL;
+
+SmRefineSpec * sm_FindRefineSpec(const SmTreeNode * cpNode)
+{
+    if (t_pRefinePrecompute == NULL)
+        return NULL;
+    auto sIter = t_pRefinePrecompute->sNodeSpecs.find(cpNode);
+    return sIter == t_pRefinePrecompute->sNodeSpecs.end() ? NULL : sIter->second;
+}
+
+template <class T>
+bool sm_SameBits(const T & crA, const T & crB)
+{
+    return std::memcmp(&crA, &crB, sizeof(T)) == 0;
+}
+
+} // end anonymous namespace
+
 #if 0
 /********************************************************************
 PURPOSE:
@@ -2627,6 +2713,17 @@ SmBoolean bDebugMe = FALSE;
   pAux2->m_bChordHeightSatisfied = pAux->m_bChordHeightSatisfied;
   pAux2->m_bAngleTolSatisfied    = pAux->m_bAngleTolSatisfied;
 
+  // split precomputed by SubdivideToTolerancesParallel(), used when its inputs match exactly
+  SmRefineSpec * pSplitSpec = pSubdivisionSurface ? sm_FindRefineSpec(pNode) : NULL;
+  if (   pSplitSpec
+      && !(   pSplitSpec->bSplit
+           && pSplitSpec->pChildSurface[0] != NULL
+           && pSplitSpec->pChildSurface[1] != NULL
+           && pSplitSpec->eDir == eSubdivideDirection
+           && pSplitSpec->cpSurface == pSubdivisionSurface
+           && sm_SameBits(pSplitSpec->sUVDomain, pAux->m_sUVDomain)))
+    { pSplitSpec = NULL; }
+
   // Parent UV domain corners
   SmPoint2d sUVMin = pAux->m_sUVDomain.GetMin();
   SmPoint2d sUVMax = pAux->m_sUVDomain.GetMax();
@@ -2661,17 +2758,28 @@ SmBoolean bDebugMe = FALSE;
                                 //         && (   pNode == pTree->GetTopNode()               
                                 //             || &this->GetSurface() != pAux->mBA_pSurface)))
         {
-          // if possible move the split parameter to a nearby existing knot 
-          SmPoint2d sUVOrig(dSplitParam,sUVMin.y);
-          SmPoint2d sUVSnapped;
-          double dSnapDist = (sUVMax.x - sUVMin.x) / 4.0;
-          SER(pSubdivisionSurface->SnapToKnots(sUVOrig,dSnapDist,sUVSnapped));
-          dSplitParam = sUVSnapped.x;
-
-          // build two new split child surfaces from the original - don't modify the original
-          const SmContext *pContext = pSubdivisionSurface->GetContext();
           SmSurface *pLeftBSS, *pRightBSS;
-          SER(pSubdivisionSurface->SplitAt(*pContext,dSplitParam,SM_SP_U,pLeftBSS,pRightBSS));
+          if (pSplitSpec)
+            {
+              // adopt the split precomputed by SubdivideToTolerancesParallel()
+              dSplitParam = pSplitSpec->dSplitParam;
+              pLeftBSS    = pSplitSpec->pChildSurface[0];
+              pRightBSS   = pSplitSpec->pChildSurface[1];
+              pSplitSpec->pChildSurface[0] = pSplitSpec->pChildSurface[1] = NULL;
+            }
+          else
+            {
+              // if possible move the split parameter to a nearby existing knot
+              SmPoint2d sUVOrig(dSplitParam,sUVMin.y);
+              SmPoint2d sUVSnapped;
+              double dSnapDist = (sUVMax.x - sUVMin.x) / 4.0;
+              SER(pSubdivisionSurface->SnapToKnots(sUVOrig,dSnapDist,sUVSnapped));
+              dSplitParam = sUVSnapped.x;
+
+              // build two new split child surfaces from the original - don't modify the original
+              const SmContext *pContext = pSubdivisionSurface->GetContext();
+              SER(pSubdivisionSurface->SplitAt(*pContext,dSplitParam,SM_SP_U,pLeftBSS,pRightBSS));
+            }
 
           // store the child surfaces in the SmSurfaceCache Subdivision Surface list
           m_sSubdivisionSurfaces.Add(pLeftBSS);
@@ -2690,8 +2798,18 @@ SmBoolean bDebugMe = FALSE;
           pAux2->m_sUVDomain.SetMinMax(SmPoint2d(dSplitParam,sUVMin.y),sUVMax);
 
           // set pNode Bounding boxes
-          pLeftBSS->CalculateBoundingBox(pAux1->m_sUVDomain, &pNode1->m_sBBox, NULL, NULL, NULL, NULL);
-          pRightBSS->CalculateBoundingBox(pAux2->m_sUVDomain, &pNode2->m_sBBox, NULL, NULL, NULL, NULL);
+          if (pSplitSpec)
+            {
+              pNode1->m_sBBox = pSplitSpec->sChildBBox[0];
+              pNode2->m_sBBox = pSplitSpec->sChildBBox[1];
+              t_pRefinePrecompute->sNodeSpecs[pNode1] = pSplitSpec->pChild[0].get();
+              t_pRefinePrecompute->sNodeSpecs[pNode2] = pSplitSpec->pChild[1].get();
+            }
+          else
+            {
+              pLeftBSS->CalculateBoundingBox(pAux1->m_sUVDomain, &pNode1->m_sBBox, NULL, NULL, NULL, NULL);
+              pRightBSS->CalculateBoundingBox(pAux2->m_sUVDomain, &pNode2->m_sBBox, NULL, NULL, NULL, NULL);
+            }
 
           SM_ASSERT_MSG(pNode1->m_sBBox.IsContainedBy(pNode->m_sBBox, SM_EFF_ZERO_SQRT),_T("pChild1 BBox not contained in pParent BBox")) ;
           SM_ASSERT_MSG(pNode2->m_sBBox.IsContainedBy(pNode->m_sBBox, SM_EFF_ZERO_SQRT),_T("pChild2 BBox not contained in pParent BBox")) ;
@@ -2784,17 +2902,28 @@ SmBoolean bDebugMe = FALSE;
                                 //        && (   pNode == pTree->GetTopNode()               
                                 //            || &this->GetSurface() != pAux->mBA_pSurface)))
         {
-          // if possible move the split parameter to a nearby existing knot 
-          SmPoint2d sUVOrig(sUVMin.x,dSplitParam);
-          SmPoint2d sUVSnapped;
-          double dSnapDist = (sUVMax.y - sUVMin.y) / 4.0;
-          SER(pSubdivisionSurface->SnapToKnots(sUVOrig,dSnapDist,sUVSnapped));
-          dSplitParam = sUVSnapped.y;
-          
-          // build two new split child surfaces from the original - don't modify the original
-          const SmContext *pContext = pSubdivisionSurface->GetContext();
           SmSurface *pBottomBSS, *pTopBSS;
-          SER(pSubdivisionSurface->SplitAt(*pContext,dSplitParam,SM_SP_V,pBottomBSS,pTopBSS));
+          if (pSplitSpec)
+            {
+              // adopt the split precomputed by SubdivideToTolerancesParallel()
+              dSplitParam = pSplitSpec->dSplitParam;
+              pBottomBSS  = pSplitSpec->pChildSurface[0];
+              pTopBSS     = pSplitSpec->pChildSurface[1];
+              pSplitSpec->pChildSurface[0] = pSplitSpec->pChildSurface[1] = NULL;
+            }
+          else
+            {
+              // if possible move the split parameter to a nearby existing knot
+              SmPoint2d sUVOrig(sUVMin.x,dSplitParam);
+              SmPoint2d sUVSnapped;
+              double dSnapDist = (sUVMax.y - sUVMin.y) / 4.0;
+              SER(pSubdivisionSurface->SnapToKnots(sUVOrig,dSnapDist,sUVSnapped));
+              dSplitParam = sUVSnapped.y;
+
+              // build two new split child surfaces from the original - don't modify the original
+              const SmContext *pContext = pSubdivisionSurface->GetContext();
+              SER(pSubdivisionSurface->SplitAt(*pContext,dSplitParam,SM_SP_V,pBottomBSS,pTopBSS));
+            }
 
           // store the child surfaces in the SmSurfaceCache Subdivision Surface list
           m_sSubdivisionSurfaces.Add(pBottomBSS);
@@ -2810,14 +2939,24 @@ SmBoolean bDebugMe = FALSE;
 
           // set pNode Bounding boxes
           // It's useless to continue if these fail, so SER. [B62]
-          SER( pBottomBSS->CalculateBoundingBox(pAux1->m_sUVDomain,
-                                                &pNode1->m_sBBox, NULL, 
-                                                NULL, NULL, 
-                                                NULL));
-          SER( pTopBSS->CalculateBoundingBox   (pAux2->m_sUVDomain,
-                                                &pNode2->m_sBBox, NULL, 
-                                                NULL, NULL, 
-                                                NULL));
+          if (pSplitSpec)
+            {
+              pNode1->m_sBBox = pSplitSpec->sChildBBox[0];
+              pNode2->m_sBBox = pSplitSpec->sChildBBox[1];
+              t_pRefinePrecompute->sNodeSpecs[pNode1] = pSplitSpec->pChild[0].get();
+              t_pRefinePrecompute->sNodeSpecs[pNode2] = pSplitSpec->pChild[1].get();
+            }
+          else
+            {
+              SER( pBottomBSS->CalculateBoundingBox(pAux1->m_sUVDomain,
+                                                    &pNode1->m_sBBox, NULL,
+                                                    NULL, NULL,
+                                                    NULL));
+              SER( pTopBSS->CalculateBoundingBox   (pAux2->m_sUVDomain,
+                                                    &pNode2->m_sBBox, NULL,
+                                                    NULL, NULL,
+                                                    NULL));
+            }
 
 #ifdef SM_DEBUG_CODE
           if(!pNode1->m_sBBox.IsContainedBy(pNode->m_sBBox, SM_EFF_ZERO_SQRT))
@@ -3717,7 +3856,9 @@ static constexpr SmBoolean bLogMe = FALSE ;
           //   TRUE = when m_eTessellationAlgorithm == SM_TA_FASTER_TESSELLATION: call SubdivideByBlock()
           //          else                                                        call SubdivideNode()
           //   FALSE= call SubdivideNode()
-          m_bSwitchToFastSubdivision = TRUE;
+          // Worker threads of SubdivideToTolerancesParallel() capture this signal instead.
+          if (t_pFastSubdivisionSink) { *t_pFastSubdivisionSink = TRUE; }
+          else                        { m_bSwitchToFastSubdivision = TRUE; }
 #ifdef SM_SBDV_LOG
           if(bLogMe)
             {
@@ -4011,49 +4152,25 @@ static SmStatus sm_CullArray( SmTArray<double> & sArr )
 } // end sm_CullArray
 
 /*******************************************************************//**
-PURPOSE: Subdivide a surface by picking tolerance satisfying
-            iso-curves partitions.
+PURPOSE: Static helper routine: find the U and V splits of a
+            SmSurfaceCache::SubdivideByBlock() block by tessellating
+            sample isoParameter Curves.
 
-NOTES: 
-   1. Expects the input TreeNode->m_eAuxDataType == SM_AD_AUX_DATA and builds
-      all descendants as SM_AD_AUX_DATA (without bezier patches) as well.
-   2. preserves the following subdivision rule for every parent/child relation
-       for pParentNode->m_pData->m_eSplitDir = oneof SM_SP_U, SM_SP_V, where
-              SM_SP_U: make new Child1 = left
-                                Child2 = right
-              SM_SP_V: make new Child1 = bot
-                                Child2 = top
+NOTES: Pure; shared by SubdivideByBlock() and its precomputation in
+       SubdivideToTolerancesParallel().
+       rbNoSplits = TRUE when the block needs no base nodes.
 ***********************************************************************/
-SmStatus SmSurfaceCache::SubdivideByBlock(SmTree* pTree, // in : Tree under construction
-                                          SmTreeNode* pNode) // in : target node
+static SmStatus sm_ComputeBlockSplits
+ (const SmSurface  * pSurface,               // in : block subdivision surface
+  double             dChordHeightTolerance,  // in : SmSurfaceCache::m_dChordHeightTolerance
+  double             dAngTolRad,             // in : SmSurfaceCache::m_dAngTolRad
+  double             dMaximumSideLength3D,   // in : SmSurfaceCache::m_dMaximumSideLength3D
+  SmTArray<double> & sUSplits,               // out: U splits, culled, including end values
+  SmTArray<double> & sVSplits,               // out: V splits, culled, including end values
+  SmBoolean        & rbNoSplits)             // out: TRUE = no base nodes to build
 {
-    // check state
-    SM_ASSERT(pNode->m_eAuxDataType == SM_AD_AUX_DATA);
-
-    // locals
-    SmBezierAux2d* pAux = (SmBezierAux2d*)pNode->m_pData;
-    const SmSurface* pSurface = pAux->mBA_pSurface;
-    NER(pSurface);
+    rbNoSplits = FALSE;
     SmExtent2d sUVDomain = pSurface->GetNaturalUVDomain();
-
-    SM_ASSERT(pSurface->IsKindOf(SmBSplineSurface_TYPE));
-
-#ifdef SM_DEBUG_CODE
-    SmBoolean bDebugMe = FALSE;
-    if (bDebugMe)
-    {
-        smgfx_Erase();
-        smgfx_SetLook(1, 2, 0, 1, 1);
-        pSurface->DrawUV(5, 5);
-        sm_GraphicsLoop();
-        sm_GraphicsLoop();
-    }
-#endif // SM_DEBUG_CODE
-
-    // Find acceptable U and V split points by tessellating sample isoParameter Curves
-    double sDData[256], sDData2[256];
-    SmTArray<double> sUSplits(256, sDData);
-    SmTArray<double> sVSplits(256, sDData2);
 
     // remember need to check diagonal when all natural isoParam Curves are linear
     // i.e. non-planar surfaces with linear edges.
@@ -4065,7 +4182,7 @@ SmStatus SmSurfaceCache::SubdivideByBlock(SmTree* pTree, // in : Tree under cons
     SM_TYPE eSurfaceType = pSurface->GetType();
     if (eSurfaceType == SmBSplineSurface_TYPE || eSurfaceType == SmSurfOfExtrusion_TYPE)
     {
-        double dTol = m_dChordHeightTolerance > 0.0 ? m_dChordHeightTolerance / 2.0 : SM_EFF_ZERO_SQRT;
+        double dTol = dChordHeightTolerance > 0.0 ? dChordHeightTolerance / 2.0 : SM_EFF_ZERO_SQRT;
         SmIsoCurve sU0(*pSurface, SM_SP_U, sUVDomain.GetMin().x, TRUE);
 
         if (sU0.IsLinear(dTol))
@@ -4091,12 +4208,12 @@ SmStatus SmSurfaceCache::SubdivideByBlock(SmTree* pTree, // in : Tree under cons
     // UDir tessellation points
     SER(pSurface->FindTessellationSplits(SM_SP_U, // in : oneof: SM_SP_U, SM_SP_V
                                          sUVDomain, // in : surface domain
-                                         this->m_dChordHeightTolerance, // in : max height/length allowed ratio,
-                                                                        // 0=ignore
-                                         this->m_dAngTolRad * 180.0 / SM_PI, // in : max angle between tessellation pt
-                                                                             // tangents, 0=ignore
-                                         this->m_dMaximumSideLength3D, // in : max length between tessellation pts,
-                                                                       // 0=ignore
+                                         dChordHeightTolerance, // in : max height/length allowed ratio,
+                                                                // 0=ignore
+                                         dAngTolRad * 180.0 / SM_PI, // in : max angle between tessellation pt
+                                                                     // tangents, 0=ignore
+                                         dMaximumSideLength3D, // in : max length between tessellation pts,
+                                                               // 0=ignore
                                          sVSplits, // out: array of tessellation pts
                                                    //      (including end-pts, so size >= 2 always)
                                          bCheckDiagonals)); // in : TRUE = when U and V dirs are linear tesselate
@@ -4106,12 +4223,12 @@ SmStatus SmSurfaceCache::SubdivideByBlock(SmTree* pTree, // in : Tree under cons
     // VDir tessellation points
     SER(pSurface->FindTessellationSplits(SM_SP_V, // in : oneof: SM_SP_U, SM_SP_V
                                          sUVDomain, // in : surface domain
-                                         this->m_dChordHeightTolerance, // in : max height/length allowed ratio,
-                                                                        // 0=ignore
-                                         this->m_dAngTolRad * 180 / SM_PI, // in : max angle between tessellation pt
-                                                                           // tangents, 0=ignore
-                                         this->m_dMaximumSideLength3D, // in : max length between tessellation pts,
-                                                                       // 0=ignore
+                                         dChordHeightTolerance, // in : max height/length allowed ratio,
+                                                                // 0=ignore
+                                         dAngTolRad * 180 / SM_PI, // in : max angle between tessellation pt
+                                                                   // tangents, 0=ignore
+                                         dMaximumSideLength3D, // in : max length between tessellation pts,
+                                                               // 0=ignore
                                          sUSplits, // out: array of tessellation pts
                                                    //      (including end-pts, so size >= 2 always)
                                          bCheckDiagonals)); // in : TRUE = when U and V dirs are linear tesselate
@@ -4129,6 +4246,7 @@ SmStatus SmSurfaceCache::SubdivideByBlock(SmTree* pTree, // in : Tree under cons
     // no work - no splits
     if (lNumSplitsU <= 2 && lNumSplitsV <= 2)
     {
+        rbNoSplits = TRUE;
         return (SM_SUCCESS);
     }
 
@@ -4148,6 +4266,118 @@ SmStatus SmSurfaceCache::SubdivideByBlock(SmTree* pTree, // in : Tree under cons
         lTotal = lNumSplitsU * lNumSplitsV;
 
     } // end while culling points to reduce total facet count
+
+    return SM_SUCCESS;
+
+} // end sm_ComputeBlockSplits
+
+/*******************************************************************//**
+PURPOSE: Static helper routine: bound one SmSurfaceCache::SubdivideByBlock()
+            base node by copying its sub patch.
+
+NOTES: Pure; shared by SubdivideByBlock() and its precomputation in
+       SubdivideToTolerancesParallel().
+       Returns FALSE when the sub patch can't be made and rBBox is untouched.
+***********************************************************************/
+static SmBoolean sm_ComputeBlockCellBBox
+ (const SmContext  & crContext,      // in : context for the temporary sub patch
+  const SmSurface  * pSurface,       // in : block subdivision surface
+  const SmExtent2d & crNodeUVDomain, // in : base node domain
+  SmExtent3d       & rBBox)          // out: base node bounding box
+{
+  SmBSplineSurface *pPatch = NULL ;
+  ((SmBSplineSurface*)pSurface)->CopySubPatch(crContext, crNodeUVDomain, pPatch) ;
+
+  if ( pPatch == NULL )
+    { return FALSE; }
+
+  SmObjDelete sClean(pPatch) ;
+
+  pPatch->CalculateBoundingBox( pPatch->GetNaturalUVDomain(), // in : only whole surfaces are bounded (except for polarBoxes of analytic surfaces)
+                                &rBBox,                       // out: Axis alligned box
+                                NULL,                         // out: Non-axis aligned box
+                                NULL,                         // out: Surface normal vector field bounding box
+                                NULL,                         // in : guess for PseudoBox basis vectors - used unless another better orientation is found
+                                                              //      NULL to ignore, default:[NULL]
+                                NULL) ;                       // in : guess for PolarBox basis vectors - used unless another better orientation is found
+                                                              //      NULL to ignore, default:[NULL]
+  return TRUE;
+
+} // end sm_ComputeBlockCellBBox
+
+/*******************************************************************//**
+PURPOSE: Subdivide a surface by picking tolerance satisfying
+            iso-curves partitions.
+
+NOTES: 
+   1. Expects the input TreeNode->m_eAuxDataType == SM_AD_AUX_DATA and builds
+      all descendants as SM_AD_AUX_DATA (without bezier patches) as well.
+   2. preserves the following subdivision rule for every parent/child relation
+       for pParentNode->m_pData->m_eSplitDir = oneof SM_SP_U, SM_SP_V, where
+              SM_SP_U: make new Child1 = left
+                                Child2 = right
+              SM_SP_V: make new Child1 = bot
+                                Child2 = top
+***********************************************************************/
+SmStatus SmSurfaceCache::SubdivideByBlock(SmTree* pTree, // in : Tree under construction
+                                          SmTreeNode* pNode) // in : target node
+{
+    // check state
+    SM_ASSERT(pNode->m_eAuxDataType == SM_AD_AUX_DATA);
+
+    // locals
+    SmBezierAux2d* pAux = (SmBezierAux2d*)pNode->m_pData;
+    const SmSurface* pSurface = pAux->mBA_pSurface;
+    NER(pSurface);
+
+    SM_ASSERT(pSurface->IsKindOf(SmBSplineSurface_TYPE));
+
+#ifdef SM_DEBUG_CODE
+    SmBoolean bDebugMe = FALSE;
+    if (bDebugMe)
+    {
+        smgfx_Erase();
+        smgfx_SetLook(1, 2, 0, 1, 1);
+        pSurface->DrawUV(5, 5);
+        sm_GraphicsLoop();
+        sm_GraphicsLoop();
+    }
+#endif // SM_DEBUG_CODE
+
+    // results precomputed by SubdivideToTolerancesParallel(), if any
+    SmRefineSpec  * pSpec  = sm_FindRefineSpec(pNode);
+    SmRefineBlock * pBlock = (pSpec && pSpec->cpSurface == pSurface) ? pSpec->pBlock.get() : NULL;
+
+    // Find acceptable U and V split points by tessellating sample isoParameter Curves
+    double sDData[256], sDData2[256];
+    SmTArray<double> sUSplits(256, sDData);
+    SmTArray<double> sVSplits(256, sDData2);
+    SmBoolean bNoSplits = FALSE;
+    if (pBlock)
+    {
+        bNoSplits = pBlock->bEarlyReturn;
+        sUSplits  = pBlock->sUSplits;
+        sVSplits  = pBlock->sVSplits;
+    }
+    else
+    {
+        SER(sm_ComputeBlockSplits(pSurface,
+                                  m_dChordHeightTolerance,
+                                  m_dAngTolRad,
+                                  m_dMaximumSideLength3D,
+                                  sUSplits,
+                                  sVSplits,
+                                  bNoSplits));
+    }
+
+    // no work - no splits
+    if (bNoSplits)
+    {
+        return (SM_SUCCESS);
+    }
+
+    ULONG lNumSplitsU = sUSplits.GetSize();
+    ULONG lNumSplitsV = sVSplits.GetSize();
 
     // create (sUSplits.GetSize()-1) * (sVSplits.GetSize()-1) base nodes
     //        which share a total of (sUSplits.GetSize()) * (sVSplits.GetSize()) TreeVertices
@@ -4228,29 +4458,21 @@ SmStatus SmSurfaceCache::SubdivideByBlock(SmTree* pTree, // in : Tree under cons
           pBaseAux->m_bAngleTolSatisfied    = FALSE;
           
           // for pBaseNode->m_sBBox and pBaseAux->m_sPolarBox
-          SmBSplineSurface *pPatch = NULL ;
-          ((SmBSplineSurface*)pSurface)->CopySubPatch(*GetContext(), sNodeUVDomain, pPatch) ;
-
-          // If that fails, do what we can and continue.  [B429]
-          if ( pPatch == NULL )
+          if (pBlock)
+            {
+              const ULONG lCell = (i-1)*(lNumSplitsV-1) + (j-1);
+              if (!pBlock->sCellHasPatch[lCell])
+                { continue; }
+              pBaseNode->m_sBBox = pBlock->sCellBBox[lCell];
+            }
+          // If the sub patch can't be made, do what we can and continue.  [B429]
+          else if (!sm_ComputeBlockCellBBox(*GetContext(), pSurface, sNodeUVDomain, pBaseNode->m_sBBox))
             {
           //    // Set Polar box to the guess.
           //    pBaseAux->m_sPolarBox = pAux->m_sPolarBox;
 
               continue;
             }
-
-          SmObjDelete sClean(pPatch) ; 
-
-          // set pBaseNode->m_sBBox and pBaseAux->m_sPolarBox
-          pPatch->CalculateBoundingBox( pPatch->GetNaturalUVDomain(), // in : only whole surfaces are bounded (except for polarBoxes of analytic surfaces) 
-                                       &pBaseNode->m_sBBox,           // out: Axis alligned box
-                                        NULL,                         // out: Non-axis aligned box
-                                        NULL,                         // out: Surface normal vector field bounding box
-                                        NULL,                         // in : guess for PseudoBox basis vectors - used unless another better orientation is found
-                                                                      //      NULL to ignore, default:[NULL]
-                                        NULL) ;                       // in : guess for PolarBox basis vectors - used unless another better orientation is found
-                                                                      //      NULL to ignore, default:[NULL]
 
           SM_ASSERT_MSG(pBaseNode->m_sBBox.IsContainedBy(pNode->m_sBBox, SM_EFF_ZERO_SQRT),_T("SmSurfaceCache::SubdivideByBlock - BlockChild BBox not contained in BlockRoot BBox")) ;
 
@@ -4532,11 +4754,35 @@ TCHAR            sBuff[SM_TBLOCK_SIZE];
   //           SmTessSrfCache::m_pSurfaceTessDriver->GetType() == SmViewBasedTessDriver_TYPE.
   SmBoolean       bSubdivideNode;
   SmSurfParamType eSubdivisionDirection;
-  SER(TestAgainstTolerances(pNode,                   // in : node to test                             
-                            bSubdivideNode,          // out: TRUE = patch fails some tessellation test
-                            eSubdivisionDirection)); // out: suggested direction to split bad elements
-                                                     //      oneof: SM_SP_U: Child1 = left, Child2 = right
-                                                     //             SM_SP_V: Child1 = bot,  Child2 = top  
+
+  // Use a test result precomputed by SubdivideToTolerancesParallel() when its inputs match exactly
+  SmRefineSpec  * pSpec    = sm_FindRefineSpec(pNode);
+  SmBezierAux2d * pSpecAux = (SmBezierAux2d*)pNode->m_pData;
+  if (   pSpec
+      && pSpec->eTestStatus == SM_SUCCESS
+      && pNode->m_eAuxDataType == SM_AD_AUX_DATA
+      && pNode->m_pChild1 == NULL
+      && pSpecAux->mBA_pSurface == pSpec->cpSurface
+      && pSpecAux->m_bChordHeightSatisfied == pSpec->bChordIn
+      && pSpecAux->m_bAngleTolSatisfied    == pSpec->bAngleIn
+      && sm_SameBits(pSpecAux->m_sUVDomain, pSpec->sUVDomain)
+      && sm_SameBits(pNode->m_sBBox, pSpec->sBBoxIn))
+    {
+      bSubdivideNode                    = pSpec->bNeedsSub;
+      eSubdivisionDirection             = pSpec->eDir;
+      pSpecAux->m_bChordHeightSatisfied = pSpec->bChordOut;
+      pSpecAux->m_bAngleTolSatisfied    = pSpec->bAngleOut;
+      pNode->m_sBBox                    = pSpec->sBBoxOut;
+      if (pSpec->bSetFast) { m_bSwitchToFastSubdivision = TRUE; }
+    }
+  else
+    {
+      SER(TestAgainstTolerances(pNode,                   // in : node to test
+                                bSubdivideNode,          // out: TRUE = patch fails some tessellation test
+                                eSubdivisionDirection)); // out: suggested direction to split bad elements
+                                                         //      oneof: SM_SP_U: Child1 = left, Child2 = right
+                                                         //             SM_SP_V: Child1 = bot,  Child2 = top
+    }
   // no work - patch currently within tolerance
   if (bSubdivideNode == FALSE)                 
     {
@@ -4731,6 +4977,234 @@ SmBoolean bDebugMe = FALSE;
   return SM_SUCCESS;
 
 } // end SmSurfaceCache::SubdivideToTolerances
+
+/*******************************************************************//**
+PURPOSE: SubdivideToTolerances() for a BSpline subdivision surface, with
+            its tolerance tests, node splits and block subdivisions
+            computed on worker threads first.
+
+NOTES:
+  1. Builds the same tree as SubdivideToTolerances(pTree, pTopNode, NULL).
+  2. Worker threads first explore the tree in which every node that fails
+     its tests, and does not set m_bSwitchToFastSubdivision itself, is split.
+     The serial tree is a pruning of that tree: a node becomes a block
+     instead when an earlier node in depth first order left the switch set.
+  3. A serial walk replays the switch to find the block nodes, whose
+     subdivisions are then computed on worker threads.
+  4. The serial recursion runs last, looking up these results.
+  5. Callers must ensure TestAgainstTolerances() is thread-safe: no view
+     based driver, no notify callbacks and no subdivision surface attributes.
+***********************************************************************/
+SmStatus SmSurfaceCache::SubdivideToTolerancesParallel
+  (SmTree     * pTree,     // i/o: Tree to modify
+   SmTreeNode * pTopNode)  // in : top node, m_eAuxDataType == SM_AD_AUX_DATA
+{
+  SmBezierAux2d * pTopAux = (SmBezierAux2d*)pTopNode->m_pData;
+  if (   t_pRefinePrecompute != NULL
+      || pTopNode->m_eAuxDataType != SM_AD_AUX_DATA
+      || pTopNode->m_pChild1 != NULL
+      || pTopAux->mBA_pSurface == NULL
+      || !pTopAux->mBA_pSurface->IsKindOf(SmBSplineSurface_TYPE))
+    {
+      return SubdivideToTolerances(pTree, pTopNode, NULL);
+    }
+
+  // build lazily created NLib data before worker threads share the surface
+  ((SmBSplineSurface*)pTopAux->mBA_pSurface)->GetOrCreateGwNurbPointer();
+
+  std::unique_ptr<SmRefineSpec> pRoot(new SmRefineSpec);
+  pRoot->sUVDomain = pTopAux->m_sUVDomain;
+  pRoot->cpSurface = pTopAux->mBA_pSurface;
+  pRoot->bChordIn  = pTopAux->m_bChordHeightSatisfied;
+  pRoot->bAngleIn  = pTopAux->m_bAngleTolSatisfied;
+  pRoot->sBBoxIn   = pTopNode->m_sBBox;
+
+  // worker computations, each performing the same operations as its serial counterpart
+  struct Worker
+  {
+    SmSurfaceCache * pCache;
+    SmBoolean        bBlocksAllowed;  // SubdivideToTolerances() may call SubdivideByBlock()
+
+    // TestAgainstTolerances() on a scratch node holding the spec's inputs
+    void Test(SmRefineSpec * pSpec) const
+    {
+      SmTreeNode    sNode;
+      SmBezierAux2d sAux;
+      sNode.m_pTree                = pCache->GetTree();
+      sNode.m_eAuxDataType         = SM_AD_AUX_DATA;
+      sNode.m_pData                = &sAux;
+      sNode.m_eGeomType            = SM_NG_DEFAULT;
+      sNode.m_sBBox                = pSpec->sBBoxIn;
+      sAux.m_pOwningTreeNode       = &sNode;
+      sAux.m_sUVDomain             = pSpec->sUVDomain;
+      sAux.m_vVertexList.Init();
+      sAux.m_sEdgeuseList.Init();
+      sAux.m_sPolyEdgeList.Init();
+      sAux.mBA_pSurface            = pSpec->cpSurface;
+      sAux.m_bChordHeightSatisfied = pSpec->bChordIn;
+      sAux.m_bAngleTolSatisfied    = pSpec->bAngleIn;
+
+      SmBoolean bSetFast = FALSE;
+      t_pFastSubdivisionSink = &bSetFast;
+      pSpec->eTestStatus = pCache->TestAgainstTolerances(&sNode, pSpec->bNeedsSub, pSpec->eDir);
+      t_pFastSubdivisionSink = NULL;
+
+      pSpec->bSetFast  = bSetFast;
+      pSpec->bChordOut = sAux.m_bChordHeightSatisfied;
+      pSpec->bAngleOut = sAux.m_bAngleTolSatisfied;
+      pSpec->sBBoxOut  = sNode.m_sBBox;
+    }
+
+    // SubdivideNode() of an SM_AD_AUX_DATA node with a subdivision surface.
+    // Any failure leaves bSplit FALSE so the serial pass recomputes it.
+    void Split(SmRefineSpec * pSpec) const
+    {
+      SmBSplineSurface * pSurface = (SmBSplineSurface*)pSpec->cpSurface;
+      const SmContext  * pContext = pSurface->GetContext();
+      SmPoint2d  sUVMin = pSpec->sUVDomain.GetMin();
+      SmPoint2d  sUVMax = pSpec->sUVDomain.GetMax();
+      SmPoint2d  sUVSnapped;
+      SmExtent2d sChildDomain[2];
+      double     dSplitParam;
+      if (pSpec->eDir == SM_SP_U)
+        {
+          dSplitParam = ( sUVMax.x + sUVMin.x ) / 2.0;
+          SmPoint2d sUVOrig(dSplitParam,sUVMin.y);
+          double dSnapDist = (sUVMax.x - sUVMin.x) / 4.0;
+          if (pSurface->SnapToKnots(sUVOrig,dSnapDist,sUVSnapped) != SM_SUCCESS)
+            { return; }
+          dSplitParam = sUVSnapped.x;
+          if (pSurface->SplitAt(*pContext,dSplitParam,SM_SP_U,pSpec->pChildSurface[0],pSpec->pChildSurface[1]) != SM_SUCCESS)
+            { return; }
+          sChildDomain[0].SetMinMax(sUVMin,SmPoint2d(dSplitParam,sUVMax.y));
+          sChildDomain[1].SetMinMax(SmPoint2d(dSplitParam,sUVMin.y),sUVMax);
+          pSpec->pChildSurface[0]->CalculateBoundingBox(sChildDomain[0], &pSpec->sChildBBox[0], NULL, NULL, NULL, NULL);
+          pSpec->pChildSurface[1]->CalculateBoundingBox(sChildDomain[1], &pSpec->sChildBBox[1], NULL, NULL, NULL, NULL);
+        }
+      else
+        {
+          dSplitParam = ( sUVMax.y + sUVMin.y ) / 2.0;
+          SmPoint2d sUVOrig(sUVMin.x,dSplitParam);
+          double dSnapDist = (sUVMax.y - sUVMin.y) / 4.0;
+          if (pSurface->SnapToKnots(sUVOrig,dSnapDist,sUVSnapped) != SM_SUCCESS)
+            { return; }
+          dSplitParam = sUVSnapped.y;
+          if (pSurface->SplitAt(*pContext,dSplitParam,SM_SP_V,pSpec->pChildSurface[0],pSpec->pChildSurface[1]) != SM_SUCCESS)
+            { return; }
+          sChildDomain[0].SetMinMax(sUVMin,SmPoint2d(sUVMax.x,dSplitParam));
+          sChildDomain[1].SetMinMax(SmPoint2d(sUVMin.x,dSplitParam),sUVMax);
+          if (   pSpec->pChildSurface[0]->CalculateBoundingBox(sChildDomain[0], &pSpec->sChildBBox[0], NULL, NULL, NULL, NULL) != SM_SUCCESS
+              || pSpec->pChildSurface[1]->CalculateBoundingBox(sChildDomain[1], &pSpec->sChildBBox[1], NULL, NULL, NULL, NULL) != SM_SUCCESS)
+            { return; }
+        }
+
+      for (int ii = 0; ii < 2; ii++)
+        {
+          SmRefineSpec * pChild = new SmRefineSpec;
+          pSpec->pChild[ii].reset(pChild);
+          pChild->sUVDomain = sChildDomain[ii];
+          pChild->cpSurface = SM_CAST_PTR(SmBSplineSurface, pSpec->pChildSurface[ii]);
+          pChild->bChordIn  = pSpec->bChordOut;
+          pChild->bAngleIn  = pSpec->bAngleOut;
+          pChild->sBBoxIn   = pSpec->sChildBBox[ii];
+          if (pChild->cpSurface == NULL)
+            { return; }
+        }
+      pSpec->dSplitParam = dSplitParam;
+      pSpec->bSplit      = TRUE;
+    }
+
+    // tests and splits of every node that is split unless it becomes a block
+    void Explore(SmRefineSpec * pSpec) const
+    {
+      Test(pSpec);
+      if (pSpec->eTestStatus != SM_SUCCESS || !pSpec->bNeedsSub)
+        { return; }
+      if (bBlocksAllowed && pSpec->bSetFast)
+        { return; }  // a block wherever the serial pass reaches it
+      Split(pSpec);
+      if (!pSpec->bSplit)
+        { return; }
+      tbb::parallel_invoke([&] { Explore(pSpec->pChild[0].get()); },
+                           [&] { Explore(pSpec->pChild[1].get()); });
+    }
+
+    // SubdivideByBlock() computations, without building nodes
+    void Block(SmRefineSpec * pSpec) const
+    {
+      std::unique_ptr<SmRefineBlock> pBlock(new SmRefineBlock);
+      if (sm_ComputeBlockSplits(pSpec->cpSurface,
+                                pCache->m_dChordHeightTolerance,
+                                pCache->m_dAngTolRad,
+                                pCache->m_dMaximumSideLength3D,
+                                pBlock->sUSplits,
+                                pBlock->sVSplits,
+                                pBlock->bEarlyReturn) != SM_SUCCESS)
+        { return; }
+      if (!pBlock->bEarlyReturn)
+        {
+          const ULONG     lNumV  = pBlock->sVSplits.GetSize() - 1;
+          const size_t    lCells = (size_t)(pBlock->sUSplits.GetSize() - 1) * lNumV;
+          const SmContext & crContext = *pCache->GetContext();
+          pBlock->sCellHasPatch.assign(lCells, 0);
+          pBlock->sCellBBox.resize(lCells);
+          tbb::parallel_for(size_t(0), lCells, [&](size_t lCell)
+            {
+              const ULONG i = (ULONG)(lCell / lNumV) + 1;
+              const ULONG j = (ULONG)(lCell % lNumV) + 1;
+              SmExtent2d sNodeUVDomain(pBlock->sUSplits[i-1], pBlock->sVSplits[j-1], pBlock->sUSplits[i], pBlock->sVSplits[j]) ;
+              pBlock->sCellHasPatch[lCell] =
+                sm_ComputeBlockCellBBox(crContext, pSpec->cpSurface, sNodeUVDomain, pBlock->sCellBBox[lCell]) ? 1 : 0;
+            });
+        }
+      pSpec->pBlock = std::move(pBlock);
+    }
+  } ; // end struct Worker
+
+  const Worker sWorker = {this, m_eTessellationAlgorithm == SM_TA_FASTER_TESSELLATION};
+  sWorker.Explore(pRoot.get());
+
+  // Replay the serial depth first recursion and its m_bSwitchToFastSubdivision
+  // value to find the nodes it subdivides by block.
+  std::vector<SmRefineSpec*> sBlocks;
+  {
+    SmBoolean bSwitch = m_bSwitchToFastSubdivision;
+    std::vector<SmRefineSpec*> sStack(1, pRoot.get());
+    while (!sStack.empty())
+      {
+        SmRefineSpec * pSpec = sStack.back();
+        sStack.pop_back();
+        if (pSpec->eTestStatus != SM_SUCCESS)
+          { break; }  // the serial pass returns the error here
+        if (pSpec->bSetFast)
+          { bSwitch = TRUE; }
+        if (!pSpec->bNeedsSub)
+          { continue; }
+        if (bSwitch && sWorker.bBlocksAllowed)
+          {
+            sBlocks.push_back(pSpec);
+            bSwitch = FALSE;
+            continue;
+          }
+        if (!pSpec->bSplit)
+          { break; }  // the serial pass computes the rest itself
+        sStack.push_back(pSpec->pChild[1].get());
+        sStack.push_back(pSpec->pChild[0].get());
+      }
+  }
+  tbb::parallel_for(size_t(0), sBlocks.size(), [&](size_t ii) { sWorker.Block(sBlocks[ii]); });
+
+  // serial recursion with lookups
+  SmRefinePrecompute sPrecompute;
+  sPrecompute.sNodeSpecs[pTopNode] = pRoot.get();
+  t_pRefinePrecompute = &sPrecompute;
+  SmStatus eStat = SubdivideToTolerances(pTree, pTopNode, NULL);
+  t_pRefinePrecompute = NULL;
+
+  // unadopted child surfaces are deleted with pRoot
+  return eStat;
+
+} // end SmSurfaceCache::SubdivideToTolerancesParallel
 
 // GWC removed unused function
 //      

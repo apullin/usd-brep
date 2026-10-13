@@ -13181,7 +13181,27 @@ SmStatus SmTessSrfCache::BuildTreeWithSubdivision
   //        - SmSurfaceCache::BuildTreeBase() calls SubdivideToTolerances()
   //             - with an array of nodes encompassing pieces of the whole surface
   //             - and pNode->m_eAuxDataType == SM_AD_BEZIER_SURFACE (m_pData = (SmBezierPatch *))
-  SER(SubdivideToTolerances(m_pTree,pTopNode,NULL));
+  // Large surfaces subdivide on worker threads when TestAgainstTolerances() is thread-safe:
+  //   the view based driver changes cache tolerances, notify callbacks and attributes are
+  //   shared by the subdivision surfaces.
+  static const SmBoolean sbParallelRefinement = (getenv("SMLIB_TESS_SERIAL_REFINEMENT") == NULL);
+  static constexpr ULONG slMinParallelControlPoints = 256;
+  SmContext *pContext = (SmContext *)GetContext();
+  if (   sbParallelRefinement
+      && m_pSurfaceTessDriver->GetType() != SmViewBasedTessDriver_TYPE
+      && pContext != NULL
+      && pContext->GetUserNotifyCallback() == NULL
+      && pContext->GetSysNotifyCallback()  == NULL
+      && !pBSSCopy->HasAttributes()
+      &&   pBSSCopy->GetNumberControlPoints(SM_SP_U) * pBSSCopy->GetNumberControlPoints(SM_SP_V)
+        >= slMinParallelControlPoints)
+    {
+      SER(SubdivideToTolerancesParallel(m_pTree,pTopNode));
+    }
+  else
+    {
+      SER(SubdivideToTolerances(m_pTree,pTopNode,NULL));
+    }
 
   // gwc: the following block could be added - but the values are not used so allow the arrays to be empty in AssertValid
   //  // Set the continuities
