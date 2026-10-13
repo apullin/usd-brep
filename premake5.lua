@@ -32,6 +32,13 @@ include("premake5-libraries.lua")
 
 repo_build.setup_options()
 
+-- The performance helper generates a separate workspace and object tree, so
+-- compiler/LTO changes never reuse objects from the ordinary build.
+local smlib_perf_build_dir = os.getenv("SMLIB_PERF_BUILD_DIR")
+if smlib_perf_build_dir then
+    workspace_dir = path.join(smlib_perf_build_dir, "gmake2")
+end
+
 local smlib_no_debug_gfx_check = os.getenv("SMLIB_NO_DEBUG_GFX_CHECK") == "1"
 local smlib_target_dir = smlib_no_debug_gfx_check
     and build_dir.."/no-debug-gfx-check/"..platform.."/%{config}"
@@ -39,6 +46,9 @@ local smlib_target_dir = smlib_no_debug_gfx_check
 local smlib_obj_dir = build_dir.."/intermediate/"..platform.."/%{prj.name}"
 if smlib_no_debug_gfx_check then
     smlib_obj_dir = build_dir.."/intermediate/no-debug-gfx-check/"..platform.."/%{prj.name}"
+end
+if smlib_perf_build_dir then
+    smlib_obj_dir = path.join(smlib_perf_build_dir, "obj/%{prj.name}")
 end
 
 workspace "usd-brep"
@@ -151,7 +161,8 @@ workspace "usd-brep"
             platformDir = path.join(os.getcwd(), "_build/"..platform)
             targetDir = platformDir.."/%{cfg.buildcfg}"
             targetdir (targetDir)
-            objdir (build_dir.."/intermediate/"..platform.."/%{prj.name}")
+            objdir (smlib_perf_build_dir and smlib_obj_dir
+                or build_dir.."/intermediate/"..platform.."/%{prj.name}")
         end
     filter {}
 
