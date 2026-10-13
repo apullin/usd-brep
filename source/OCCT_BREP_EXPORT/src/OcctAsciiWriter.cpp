@@ -8,7 +8,9 @@
 
 #include "OcctAsciiWriter.h"
 
+#include <charconv>
 #include <cstdio>
+#include <limits>
 #include <string>
 
 namespace occt
@@ -36,17 +38,27 @@ public:
     }
 
     // GeomTools writes reals as whitespace-delimited tokens parsed back with strtod.
-    // %.17g preserves every double exactly on re-read.
+    // max_digits10 preserves every double exactly on re-read. to_chars avoids
+    // printf's locale handling and general-purpose floating-point formatting.
     void Real(double d)
     {
         char szBuf[32];
+        const auto result = std::to_chars(szBuf, szBuf + sizeof(szBuf), d, std::chars_format::general,
+                                          std::numeric_limits<double>::max_digits10);
+        if (result.ec == std::errc())
+        {
+            m_sOut.append(szBuf, result.ptr);
+            return;
+        }
         std::snprintf(szBuf, sizeof(szBuf), "%.17g", d);
         m_sOut.append(szBuf);
     }
 
     void Int(int i)
     {
-        m_sOut.append(std::to_string(i));
+        char szBuf[std::numeric_limits<int>::digits10 + 3];
+        const auto result = std::to_chars(szBuf, szBuf + sizeof(szBuf), i);
+        m_sOut.append(szBuf, result.ptr);
     }
 
     // Emit a real followed by a single separating space.

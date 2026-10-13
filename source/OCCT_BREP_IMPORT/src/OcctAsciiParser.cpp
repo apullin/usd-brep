@@ -5,6 +5,7 @@
 
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <climits>
 #include <cstdlib>
 #include <exception>
@@ -109,11 +110,28 @@ public:
     // OCCT's GeomTools::GetReal: read one whitespace-delimited token, parse with strtod.
     double ReadReal()
     {
-        std::string sTok;
-        if (!ReadWord(sTok))
+        SkipWhitespace();
+        if (Eof())
         {
             return 0.0; // GetReal returns 0 at eof
         }
+        const size_t uiBegin = m_uiPos;
+        const char* pBegin = m_rText.data() + uiBegin;
+        const char* pEnd = m_rText.data() + m_rText.size();
+        double dValue = 0.0;
+        const auto result = std::from_chars(pBegin, pEnd, dValue, std::chars_format::general);
+        if (result.ec == std::errc() && (result.ptr == pEnd || IsSpace(*result.ptr)))
+        {
+            m_uiPos += static_cast<size_t>(result.ptr - pBegin);
+            return dValue;
+        }
+        // Keep GetReal's strtod behavior for leading '+', hex floats, range
+        // errors, and tokens with a numeric prefix followed by other text.
+        while (m_uiPos < m_rText.size() && !IsSpace(m_rText[m_uiPos]))
+        {
+            ++m_uiPos;
+        }
+        const std::string sTok(pBegin, m_rText.data() + m_uiPos);
         return std::strtod(sTok.c_str(), nullptr);
     }
 
