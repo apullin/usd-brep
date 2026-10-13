@@ -32,9 +32,8 @@
 #include <unordered_set>
 #include <iterator>
 
-#ifdef SM_USE_TBB
 #include "tbb/parallel_for.h"
-#endif
+#include <vector>
 
 // #define TIMER_CODE 1
 
@@ -7304,6 +7303,38 @@ SmStatus SmTess::OutputFacePolygons
   SmVector3d  sNorm(0,0,0);
   SmEdgeuse * pEdgeuse ;
 
+  // Evaluate the points and normals of large BSpline faces on worker threads;
+  // the loop below uses them in place of its own evaluations.
+  static constexpr ULONG slMinParallelVertices = 2048;
+  std::vector<SmPoint3d>     sParPoints;
+  std::vector<SmVector3d>    sParNormals;
+  std::vector<SmStatus>      sParPointStatus, sParNormalStatus;
+  const SmBoolean bParallelEval =    lNumPolyVertices >= slMinParallelVertices
+                                  && pSurf->GetType() == SmBSplineSurface_TYPE;
+  if (bParallelEval)
+    {
+      const SmBoolean bNormals = rPolygonOutput.GetGenerateNormals();
+      ((SmBSplineSurface *)pSurf)->GetOrCreateGwNurbPointer();  // built before sharing the surface
+      sParPoints.resize(lNumPolyVertices);
+      sParNormals.resize(lNumPolyVertices);
+      sParPointStatus.assign(lNumPolyVertices, SM_ERR);
+      sParNormalStatus.assign(lNumPolyVertices, SM_ERR);
+      tbb::parallel_for(tbb::blocked_range<ULONG>(0, lNumPolyVertices, 64), [&](const tbb::blocked_range<ULONG> & crRange)
+        {
+          for (ULONG ii = crRange.begin(); ii != crRange.end(); ++ii)
+            {
+              SmPolyVertex * pPolyVertex = sFPB_PolyVertices[ii] ;
+              const SmPoint3d & crUV = pPolyVertex->GetPoint();
+              SmPoint2d sUVPoint( crUV.x, crUV.y );
+              // as below: vertices without an edgeuse are evaluated on the surface
+              if (!pPolyVertex->IsIndexValueInit() || !pPolyVertex->GetEdgeuse())
+                { sParPointStatus[ii] = pSurf->EvaluatePoint(sUVPoint, sParPoints[ii]); }
+              if (bNormals)
+                { sParNormalStatus[ii] = pSurf->EvaluateNormal(sUVPoint, TRUE, TRUE, sParNormals[ii]); }
+            }
+        });
+    }
+
   // for every sFPB_PolyVertex - finish IndexValue assignments, cache PolyVertex data
   for(ULONG ii=0;ii<lNumPolyVertices;ii++)
     {
@@ -7326,7 +7357,13 @@ SmStatus SmTess::OutputFacePolygons
                      sPnt        = pOrigVertex->GetPoint();
                    }
       else         { // without EU
-                     if(SM_SUCCESS != pSurf->EvaluatePoint(sUVPnt, sPnt))
+                     if (bParallelEval)
+                       {
+                         if (sParPointStatus[ii] != SM_SUCCESS)
+                           { continue; }
+                         sPnt = sParPoints[ii];
+                       }
+                     else if(SM_SUCCESS != pSurf->EvaluatePoint(sUVPnt, sPnt))
                        { continue; } // GWC???: what's the right behavior for a failed EvaluatePoint calculation
                      pOrigVertex = NULL ;
                    }
@@ -7334,7 +7371,13 @@ SmStatus SmTess::OutputFacePolygons
       // when asked - generate mesh point normals
       if (rPolygonOutput.GetGenerateNormals())
         {
-          eStat = pSurf->EvaluateNormal(sUVPnt,TRUE,TRUE,sNorm) ;
+          if (bParallelEval)
+            {
+              eStat = sParNormalStatus[ii];
+              sNorm = sParNormals[ii];
+            }
+          else
+            { eStat = pSurf->EvaluateNormal(sUVPnt,TRUE,TRUE,sNorm) ; }
           if ( eStat != SM_SUCCESS )
             { SE(eStat); continue; } // GWC???: what's the right behavior for a failed normal calculation
 
