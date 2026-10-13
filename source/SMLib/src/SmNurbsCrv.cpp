@@ -1016,6 +1016,257 @@ gw_FLAG sm_CrvGetEPolygon
 } // end sm_CrvGetEPolygon
 
 /*******************************************************************//**
+PURPOSE: Fixed-degree versions of sm_BasisEval(), sm_BasisDerivs(),
+            sm_CrvRationalBasisDerivs(), sm_CrvEval() and sm_CrvDerivs().
+
+NOTES: They perform the same floating-point operations in the same order
+       as the general routines, so results are bit-identical; only the
+       array sizes and loop bounds are known at compile time.
+***********************************************************************/
+template <int P>
+static gw_FLAG sm_BasisEvalFixed
+ (gw_KNOTVECTOR *knt,    // in : Curve's knot vector
+  gw_PARAMETER   u,      // in : target param
+  gw_FLAG        flg,    // in : oneof: LEFT, RIGHT
+  gw_REAL       *N,      // out: array of P+1 NonZero basis values
+  gw_INDEX      *spn )   // out: span associated with non-zero basis values
+{
+  const gw_REAL  dKnotTol = SM_EFF_ZERO_SQ;
+  const gw_INDEX m        = knt->m;
+  const gw_REAL *U        = knt->U;
+
+  // end values return NL_YES, as sm_BasisEval() does
+  if( u EQ U[P] )
+  {
+    N[0] = 1.0; *spn = P;
+    for( int k=1; k<=P; k++ ) N[k] = 0.0;
+    return NL_YES;
+  }
+  if( u EQ U[m-P] )
+  {
+    N[P] = 1.0; *spn = m-P-1;
+    for( int k=0; k<P; k++ ) N[k] = 0.0;
+    return NL_YES;
+  }
+
+  gw_INDEX i;
+  N_BasisFindSpan(knt,P,u,flg,&i);
+  *spn = i;
+
+  gw_REAL left[P+1], right[P+1];
+  N[0] = 1.0;
+  for( int k=1; k<=P; k++ )
+  {
+    left[k]  = u-U[i+1-k];
+    right[k] = U[i+k]-u;
+    gw_REAL saved = 0;
+    for( int l=0; l<k; l++ )
+    {
+      double dDelta = right[l+1] + left[k-l];
+      if ( dDelta < dKnotTol )
+        { return NL_YES; }
+      gw_REAL temp = N[l];
+      N[l]  = saved + temp * ( right[l+1] / dDelta );
+      saved =         temp * (  left[k-l] / dDelta );
+    }
+    N[k] = saved;
+  }
+  return NL_NO;
+}
+
+template <int P>
+static gw_FLAG sm_CrvEvalFixed
+ (gw_CURVE const * cur, // in : target curve of degree P
+  gw_PARAMETER  u,      // in : target param
+  gw_FLAG       flg,    // in : oneof LEFT, RIGHT
+  NL_POINT    * C )     // out: W of W = cur(u)
+{
+  gw_REAL  N[P+1];
+  gw_INDEX spn;
+  if( sm_BasisEvalFixed<P>(cur->knt, u, flg, N, &spn) EQ NL_YES )
+    { return NL_YES; }
+
+  gw_CPOINT * Pw    = cur->pol->Pw;
+  gw_INDEX    spn_p = spn - P;
+  gw_CPOINT   Cw;
+  Cw.x = 0.0; Cw.y = 0.0; Cw.z = 0.0; Cw.w = 0.0;
+  for( int i=0; i<=P; i++ )
+    {
+      MAC_A_updcpt(N[i], Pw[spn_p+i], &Cw);
+    }
+  TO_EUCLID(Cw,*C);
+  return NL_NO;
+}
+
+template <int P, int DER>
+static gw_FLAG sm_BasisDerivsFixed
+ (gw_KNOTVECTOR *knt,               // in : knot vector
+  gw_PARAMETER   u,                 // in : parameter
+  gw_FLAG        flg,               // in : oneof LEFT, RIGHT
+  gw_REAL        (&ND)[DER+1][P+1], // out: ND[k][j] = k-th derivative of basis function j
+  gw_INDEX      *spn )              // out: span
+{
+  const gw_REAL  dKnotTol = SM_EFF_ZERO_SQ;
+  const gw_REAL *U        = knt->U;
+  gw_INDEX       i;
+
+  if( N_BasisFindSpan(knt,P,u,flg,&i) EQ NL_YES )
+    { return NL_YES; }
+  *spn = i;
+
+  constexpr int mder = P < DER ? P : DER;
+  for( int k=P+1; k<=DER; k++ )
+    for( int j=0; j<=P; j++ )
+      ND[k][j] = 0.0;
+
+  gw_REAL left[P+1], right[P+1];
+  gw_REAL ndu[P+1][P+1];
+  ndu[0][0] = 1.0;
+  for( int j=1; j<=P; j++ )
+    {
+      left[j]  = u-U[i+1-j];
+      right[j] = U[i+j]-u;
+      gw_REAL saved = 0.0;
+      for( int r=0; r<j; r++ )
+        {
+          ndu[j][r] = right[r+1] + left[j-r];
+          if (fabs(ndu[j][r]) <= dKnotTol)
+            { return NL_YES; }
+          ndu[r][j] = saved + ndu[r][j-1] * ( right[r+1] / ndu[j][r] );
+          saved     =         ndu[r][j-1] * (  left[j-r] / ndu[j][r] );
+        }
+      ndu[j][j] = saved;
+    }
+
+  for( int j=0; j<=P; j++ )
+    ND[0][j] = ndu[j][P];
+
+  gw_REAL a[2][P+1];
+  for( int r=0; r<=P; r++ )
+    {
+      int s1 = 0, s2 = 1;
+      a[0][0] = 1.0;
+      for( int k=1; k<=mder; k++ )
+        {
+          gw_REAL *pas1 = a[s1];
+          gw_REAL *pas2 = a[s2];
+          gw_REAL  d    = 0.0;
+          int      rk   = r-k;
+          int      pk   = P-k;
+          gw_REAL *ndupk1 = ndu[pk+1];
+          if( r GE k )
+            {
+              if (fabs(ndupk1[rk]) <= dKnotTol) return NL_YES;
+              pas2[0] = pas1[0]/ndupk1[rk];
+              d       = pas2[0]*ndu[rk][pk];
+            }
+          int j1 = ( rk    GE -1 ) ? 1   : -rk;
+          int j2 = ( (r-1) LE pk ) ? k-1 : P-r;
+          for( int j=j1; j<=j2; j++ )
+            {
+              if (fabs(ndupk1[rk+j]) <= dKnotTol) return NL_YES;
+              pas2[j]  = (pas1[j]-pas1[j-1])/ndupk1[rk+j];
+              d       += pas2[j]*ndu[rk+j][pk];
+            }
+          if( r LE pk )
+            {
+              if (fabs(ndupk1[r]) <= dKnotTol) return NL_YES;
+              pas2[k]  = -pas1[k-1]/ndupk1[r];
+              d       +=  pas2[k]*ndu[r][pk];
+            }
+          ND[k][r] = d;
+          int iTmp = s1; s1 = s2; s2 = iTmp;
+        }
+    }
+
+  gw_INDEX r = P;
+  for( int k=1; k<=mder; k++ )
+    {
+      for( int j=0; j<=P; j++ )
+        ND[k][j] *= r;
+      r *= (P-k);
+    }
+  return NL_NO;
+}
+
+template <int P, int DER>
+static gw_FLAG sm_CrvDerivsFixed
+ (gw_CURVE    *cur,  // in : target curve of degree P
+  gw_PARAMETER u,    // in : target parameter
+  gw_FLAG      flg,  // in : oneof LEFT, RIGHT
+  NL_POINT    *CD )  // out: [pos, 1st, ..., DER-th]
+{
+  // NL_PascalTri rows, known at compile time
+  static constexpr long sTri[3][3] = { { 1 }, { 1, 1 }, { 1, 2, 1 } };
+  static_assert(DER <= 2, "Pascal rows");
+
+  gw_REAL  BD[DER+1][P+1];
+  gw_INDEX spn;
+  gw_CPOINT *Pw = cur->pol->Pw;
+  if( N_IsCrvRat(cur) )
+    {
+      // sm_CrvRationalBasisDerivs()
+      gw_REAL ND[DER+1][P+1];
+      if( sm_BasisDerivsFixed<P, DER>(cur->knt,u,flg,ND,&spn) EQ NL_YES )
+        { return NL_YES; }
+      gw_REAL d[DER+1];
+      for( int k=0; k<=DER; k++ )
+        {
+          d[k] = 0.0;
+          for( gw_INDEX j=spn-P; j<=spn; j++ )
+            {
+              gw_REAL w = Pw[j].w;
+              d[k] += w*ND[k][j-spn+P];
+            }
+        }
+      for( int i=0; i<=P; i++ )
+        {
+          gw_REAL w = Pw[spn-P+i].w;
+          for( int k=0; k<=DER; k++ )
+            {
+              gw_REAL v = w*ND[k][i];
+              for( int j=1; j<=k; j++ )
+                {
+                  v -= sTri[k][j]*d[j]*BD[k-j][i];
+                }
+              BD[k][i] = v/d[0];
+            }
+        }
+    }
+  else
+    {
+      if( sm_BasisDerivsFixed<P, DER>(cur->knt,u,flg,BD,&spn) EQ NL_YES )
+        { return NL_YES; }
+    }
+
+  // sm_CrvGetEPolygon()
+  gw_INDEX k = spn-P, n = cur->pol->n;
+  if( k GT spn  OR  k LT 0  OR  spn GT n )
+    {
+      N_ErrSet(NL_IND_ERR,_T("Evaluate"));
+      return 1;
+    }
+  NL_POINT Pt[P+1];
+  for( int i=0; i<=P; i++ )
+    {
+      N_CPtToPtEuclid(Pw[k+i],&Pt[i]);
+    }
+
+  for( int kk=0; kk<=DER; kk++ )
+    {
+      NL_POINT *pCD = &CD[kk];
+      pCD->x = pCD->y = pCD->z = 0.0;
+      for( int i=0; i<=P; i++ )
+        {
+          pCD->x += BD[kk][i] * Pt[i].x;
+          pCD->y += BD[kk][i] * Pt[i].y;
+          pCD->z += BD[kk][i] * Pt[i].z;
+        }
+    }
+  return NL_NO;
+}
+
+/*******************************************************************//**
 PURPOSE: Compute all non-vanishing basis functions at a given parameter
 
 NOTES: 
@@ -1287,6 +1538,24 @@ gw_FLAG  sm_CrvDerivs
 
   if (der > GW_MAX_DERIV) return 1; // error
 
+  // compile-time degrees and derivative counts for the common requests
+  if (der <= 2 && cur->p >= 1 && cur->p <= 3)
+    {
+      switch (cur->p * 4 + (int)der)
+        {
+          case 1 * 4 + 0: return sm_CrvDerivsFixed<1, 0>(cur, u, flg, CD);
+          case 1 * 4 + 1: return sm_CrvDerivsFixed<1, 1>(cur, u, flg, CD);
+          case 1 * 4 + 2: return sm_CrvDerivsFixed<1, 2>(cur, u, flg, CD);
+          case 2 * 4 + 0: return sm_CrvDerivsFixed<2, 0>(cur, u, flg, CD);
+          case 2 * 4 + 1: return sm_CrvDerivsFixed<2, 1>(cur, u, flg, CD);
+          case 2 * 4 + 2: return sm_CrvDerivsFixed<2, 2>(cur, u, flg, CD);
+          case 3 * 4 + 0: return sm_CrvDerivsFixed<3, 0>(cur, u, flg, CD);
+          case 3 * 4 + 1: return sm_CrvDerivsFixed<3, 1>(cur, u, flg, CD);
+          case 3 * 4 + 2: return sm_CrvDerivsFixed<3, 2>(cur, u, flg, CD);
+          default: break;
+        }
+    }
+
   for (i=0; i<=der; i++) { BD[i] = BD_STACK[i]; }
 
   /* Get local notation */
@@ -1440,6 +1709,15 @@ gw_FLAG sm_CrvEval
   gw_INDEX        spn_p = 0 ;
   gw_CPOINT       Cw;
   
+  // compile-time degrees for the common curves
+  switch (p)
+    {
+      case 1: return sm_CrvEvalFixed<1>(cur, u, flg, C);
+      case 2: return sm_CrvEvalFixed<2>(cur, u, flg, C);
+      case 3: return sm_CrvEvalFixed<3>(cur, u, flg, C);
+      default: break;
+    }
+
   // get array of all nonZero basis values for span containing u
   error = sm_BasisEval(knt,   // in : Curve's knot vector                                                        
                        p,     // in : curve degree                                                               
