@@ -8726,6 +8726,10 @@ SmStatus SmBSplineSurface::EvaluatePoint
 
   
   // pass the eval call along     
+  // points repeat at polygon vertices during tessellation
+  if (smsurf_FindMemoizedPoint(this, crUV, rPoint))
+    { return SM_SUCCESS; }
+
   NL_FLAG flg = NL_LEFT;
   NL_POINT  C;
   NL_FLAG err = 0;
@@ -8742,6 +8746,7 @@ SmStatus SmBSplineSurface::EvaluatePoint
 
   // set output
   COPY_XYZ(C,rPoint);
+  smsurf_MemoizePoint(this, crUV, rPoint);
   return SM_SUCCESS;
 
 } // end SmBSplineSurface::EvaluatePoint

@@ -892,6 +892,13 @@ public:
                                   SmVector3d      & rSurfaceNormal)    // out: unit-vect normal = crossProduct(Wu,Wv)                                               
                                  const ;                                                                                                                    
 
+  // SmSurface::EvaluateNormal() without an active SmSurfaceEvaluationMemo
+  SmStatus EvaluateNormalUnmemoized(const SmPoint2d & crUV,            // in : surface point within surface domain
+                                    SmBoolean         bUFromLeft,      // in : if crUV is on U interval boundary, TRUE=Use upper interval, FALSE = lower interval
+                                    SmBoolean         bVFromLeft,      // in : if crUV is on V interval boundary, TRUE=Use upper interval, FALSE = lower interval
+                                    SmVector3d      & rSurfaceNormal)  // out: unit-vect normal = crossProduct(Wu,Wv)
+                                   const ;
+
   // Sizing and Indexing for Evaluate() output arrays by partial deriv cnts.
   // examples: aDerivs[SM_SSIZE(MaxDeriv)], lHighestDeriv=MaxDeriv, 
   //     sW   = aDerivs[SM_SI(0,0)],  - position                            // when MaxDeriv is named 'lHighestDeriv'
@@ -2845,5 +2852,33 @@ SmStatus smsurf_IsPointOnNormal(const SmSurface  & crSurface,                  /
                                 double           & rdDropToSurf,               // out: when rbGoodPoint == TRUE, set to SurfPt/TestPt dist                          
                                                                                //    :   rbGoodPoint == FALSE, set to 0.0                                           
                                 double           & rdApproxDev) ;              // out: deviation between 3dPoint and srfNormalLine                                  
+
+/*******************************************************************//**
+PURPOSE: While in scope, the calling thread memoizes one surface's
+   SmSurface::EvaluateNormal(), first order EvaluateDirectionalDerivs() and
+   SmBSplineSurface::EvaluatePoint() results, which repeat at the same
+   polygon vertices during tessellation.
+
+NOTES: Memoized results are bit-identical to direct evaluation. The
+   surface must not be modified or deleted while the memo is in scope.
+***********************************************************************/
+class SM_EXPORT SmSurfaceEvaluationMemo
+{
+public:
+  explicit SmSurfaceEvaluationMemo(const SmSurface * cpSurface);
+  ~SmSurfaceEvaluationMemo();
+
+  SmSurfaceEvaluationMemo(const SmSurfaceEvaluationMemo &) = delete;
+  SmSurfaceEvaluationMemo & operator=(const SmSurfaceEvaluationMemo &) = delete;
+
+private:
+  void * m_pMemo;      // memo tables for the surface
+  void * m_pPrevious;  // memo that was active before this one
+} ;
+
+// Point evaluations memoized by an SmSurfaceEvaluationMemo in scope for cpSurface.
+// smsurf_FindMemoizedPoint() sets rPoint and returns TRUE when crUV was memoized.
+SM_EXPORT SmBoolean smsurf_FindMemoizedPoint(const SmSurface * cpSurface, const SmPoint2d & crUV, SmPoint3d & rPoint) ;
+SM_EXPORT void      smsurf_MemoizePoint     (const SmSurface * cpSurface, const SmPoint2d & crUV, const SmPoint3d & crPoint) ;
 
 #endif // __SMSURFACE_H__

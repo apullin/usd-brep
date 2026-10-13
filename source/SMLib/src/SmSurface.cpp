@@ -60,6 +60,8 @@
 #include <SmAdvSurfaceIntersector.h>
 #include <SmSurfaceDropCurve.h>
 #include <SmSurfaceSilhouette.h>
+#include <cstring>
+#include <vector>
 #include <nurbs.h>
 
 
@@ -8781,6 +8783,162 @@ SmStatus SmSurface::ComputeParamDirection
 } // end SmSurface::ComputeParamDirection
 
 /*******************************************************************//**
+   SmSurfaceEvaluationMemo tables
+***********************************************************************/
+namespace {
+
+// Open addressing table of evaluation results keyed by the exact bits of a UV point and flags
+template <int N>
+class SmEvalMemoTable
+{
+public:
+  // memoized values for the key, or NULL
+  const SmVector3d * Find(double dU, double dV, ULONG lFlags) const
+  {
+    if (m_sEntries.empty())
+      { return NULL; }
+    size_t lMask = m_sEntries.size() - 1;
+    for (size_t lIndex = Hash(dU, dV, lFlags) & lMask; m_sEntries[lIndex].bUsed; lIndex = (lIndex + 1) & lMask)
+      {
+        const Entry & crEntry = m_sEntries[lIndex];
+        if (   crEntry.lFlags == lFlags
+            && std::memcmp(&crEntry.dU, &dU, sizeof(double)) == 0
+            && std::memcmp(&crEntry.dV, &dV, sizeof(double)) == 0)
+          { return crEntry.sValues; }
+      }
+    return NULL;
+  }
+
+  // memoize the values of a key that Find() did not return
+  void Insert(double dU, double dV, ULONG lFlags, const SmVector3d * cpValues)
+  {
+    if (2 * (m_lCount + 1) > m_sEntries.size())
+      { Grow(); }
+    Entry sEntry;
+    sEntry.dU     = dU;
+    sEntry.dV     = dV;
+    sEntry.lFlags = lFlags;
+    sEntry.bUsed  = TRUE;
+    for (int ii = 0; ii < N; ii++)
+      { sEntry.sValues[ii] = cpValues[ii]; }
+    Place(sEntry);
+  }
+
+private:
+  struct Entry
+  {
+    double     dU     = 0.0;
+    double     dV     = 0.0;
+    ULONG      lFlags = 0;
+    SmBoolean  bUsed  = FALSE;
+    SmVector3d sValues[N];
+  };
+
+  static unsigned long long Mix(unsigned long long lX)
+  {
+    lX ^= lX >> 30; lX *= 0xBF58476D1CE4E5B9ull;
+    lX ^= lX >> 27; lX *= 0x94D049BB133111EBull;
+    return lX ^ (lX >> 31);
+  }
+
+  static size_t Hash(double dU, double dV, ULONG lFlags)
+  {
+    unsigned long long lU, lV;
+    std::memcpy(&lU, &dU, sizeof(double));
+    std::memcpy(&lV, &dV, sizeof(double));
+    return (size_t)(Mix(lU) ^ Mix(lV + 0x9E3779B97F4A7C15ull * (lFlags + 1)));
+  }
+
+  void Place(const Entry & crEntry)
+  {
+    size_t lMask  = m_sEntries.size() - 1;
+    size_t lIndex = Hash(crEntry.dU, crEntry.dV, crEntry.lFlags) & lMask;
+    while (m_sEntries[lIndex].bUsed)
+      { lIndex = (lIndex + 1) & lMask; }
+    m_sEntries[lIndex] = crEntry;
+    m_lCount++;
+  }
+
+  void Grow()
+  {
+    std::vector<Entry> sOld(m_sEntries.empty() ? 1024 : 2 * m_sEntries.size());
+    sOld.swap(m_sEntries);
+    m_lCount = 0;
+    for (const Entry & crEntry : sOld)
+      {
+        if (crEntry.bUsed)
+          { Place(crEntry); }
+      }
+  }
+
+  std::vector<Entry> m_sEntries;
+  size_t             m_lCount = 0;
+};
+
+struct SmEvalMemo
+{
+  const SmSurface        * cpSurface;
+  const SmBSplineSurface * cpBSpline;    // cpSurface: whose out-of-bounds mode changes clamped evaluations
+  SmEvalMemoTable<1>       sNormals;     // EvaluateNormal() results
+  SmEvalMemoTable<3>       sFirstDerivs; // Evaluate(1,1,upper half) results used by EvaluateDirectionalDerivs()
+  SmEvalMemoTable<1>       sPoints;      // SmBSplineSurface::EvaluatePoint() results
+
+  // key flags: evaluation sides and the current out-of-bounds mode
+  ULONG Flags(SmBoolean bUFromLeft, SmBoolean bVFromLeft) const
+  {
+    return (cpBSpline->IsOutOfBoundsEnabled() ? 4 : 0) | (bUFromLeft ? 2 : 0) | (bVFromLeft ? 1 : 0);
+  }
+};
+
+SM_THREAD_LOCAL SmEvalMemo * t_pEvalMemo = NULL;
+
+// memo for this surface on the calling thread, if any
+SmEvalMemo * sm_GetEvalMemo(const SmSurface * cpSurface)
+{
+  SmEvalMemo * pMemo = t_pEvalMemo;
+  return (pMemo && pMemo->cpSurface == cpSurface) ? pMemo : NULL;
+}
+
+} // end anonymous namespace
+
+SmSurfaceEvaluationMemo::SmSurfaceEvaluationMemo(const SmSurface * cpSurface)
+  : m_pMemo(NULL), m_pPrevious(t_pEvalMemo)
+{
+  // BSpline surfaces (including analytic subclasses) expose the out-of-bounds mode the keys need
+  if (cpSurface && cpSurface->IsKindOf(SmBSplineSurface_TYPE))
+    {
+      SmEvalMemo * pMemo = new SmEvalMemo;
+      pMemo->cpSurface = cpSurface;
+      pMemo->cpBSpline = (const SmBSplineSurface *)cpSurface;
+      m_pMemo     = pMemo;
+      t_pEvalMemo = pMemo;
+    }
+}
+
+SmSurfaceEvaluationMemo::~SmSurfaceEvaluationMemo()
+{
+  t_pEvalMemo = (SmEvalMemo *)m_pPrevious;
+  delete (SmEvalMemo *)m_pMemo;
+}
+
+SmBoolean smsurf_FindMemoizedPoint(const SmSurface * cpSurface, const SmPoint2d & crUV, SmPoint3d & rPoint)
+{
+  SmEvalMemo       * pMemo   = sm_GetEvalMemo(cpSurface);
+  const SmVector3d * cpSaved = pMemo ? pMemo->sPoints.Find(crUV.x, crUV.y, pMemo->Flags(TRUE, TRUE)) : NULL;
+  if (!cpSaved)
+    { return FALSE; }
+  rPoint = *cpSaved;
+  return TRUE;
+}
+
+void smsurf_MemoizePoint(const SmSurface * cpSurface, const SmPoint2d & crUV, const SmPoint3d & crPoint)
+{
+  SmEvalMemo * pMemo = sm_GetEvalMemo(cpSurface);
+  if (pMemo)
+    { pMemo->sPoints.Insert(crUV.x, crUV.y, pMemo->Flags(TRUE, TRUE), &crPoint); }
+}
+
+/*******************************************************************//**
 PURPOSE: Compute higher order directional derivatives using the chain rule.
 
 NOTES: Limited to computing 3rd derivatives
@@ -8802,8 +8960,24 @@ SmStatus SmSurface::EvaluateDirectionalDerivs
   SER_MSG(lHighestDeriv <= 3 ? SM_SUCCESS : SM_ERR, _T("Directional Derivatives only supported to 3rd order")) ;
 
   // make the surface evaluation
+  //   1st derivatives repeat at polygon vertices during tessellation: reuse memoized values
+  //   [D, Dv, Du] of the upper half matrix, which is all smgu_DirectionalDerivs() reads.
   SmVector3d aDerivs[4][4] ;
-  SER(Evaluate(crUV, lHighestDeriv, lHighestDeriv, bUFromLeft, bVFromLeft, TRUE, aDerivs[0], FALSE)) ;  // exact tangent values
+  SmEvalMemo       * pMemo   = (lHighestDeriv == 1) ? sm_GetEvalMemo(this) : NULL;
+  const ULONG        lFlags  = pMemo ? pMemo->Flags(bUFromLeft, bVFromLeft) : 0;
+  const SmVector3d * cpSaved = pMemo ? pMemo->sFirstDerivs.Find(crUV.x, crUV.y, lFlags) : NULL;
+  if (cpSaved)
+    {
+      aDerivs[0][0] = cpSaved[0];
+      aDerivs[0][1] = cpSaved[1];
+      aDerivs[0][2] = cpSaved[2];
+    }
+  else
+    {
+      SER(Evaluate(crUV, lHighestDeriv, lHighestDeriv, bUFromLeft, bVFromLeft, TRUE, aDerivs[0], FALSE)) ;  // exact tangent values
+      if (pMemo)
+        { pMemo->sFirstDerivs.Insert(crUV.x, crUV.y, lFlags, aDerivs[0]); }
+    }
 
   // pass the call along
   SER(smgu_DirectionalDerivs(rUVDir, lHighestDeriv, lHighestDeriv, aDerivs[0], aDirDerivs)) ;
@@ -11012,8 +11186,44 @@ NOTES:  This routine always returns SM_SUCCESS
 
    Note: that this routine will do its very best to find an
    answer in cases where where there is a pole or singularity.
+
+   Normals repeat at polygon vertices during tessellation: while a
+   SmSurfaceEvaluationMemo for this surface is in scope, they are reused.
 ***********************************************************************/
 SmStatus SmSurface::EvaluateNormal
+  (const SmPoint2d & crUV,            // in : target domain point
+   SmBoolean         bUFromLeft,      // in : if P is on U interval boundary
+                                      //      TRUE  = evaluate P in upper interval where P is on the left of the interval
+                                      //      FALSE = evaluate P in lower interval where P is on the right of the interval
+   SmBoolean         bVFromLeft,      // in : if P is on V interval boundary
+                                      //      TRUE  = evaluate P in upper interval where P is on the left of the interval
+                                      //      FALSE = evaluate P in lower interval where P is on the right of the interval
+   SmVector3d      & rSurfaceNormal)  // out: Unitizied(Cross(Su,Sv))
+ const
+{
+  SmEvalMemo * pMemo = sm_GetEvalMemo(this);
+  if (!pMemo)
+    { return EvaluateNormalUnmemoized(crUV, bUFromLeft, bVFromLeft, rSurfaceNormal); }
+
+  const ULONG        lFlags  = pMemo->Flags(bUFromLeft, bVFromLeft);
+  const SmVector3d * cpSaved = pMemo->sNormals.Find(crUV.x, crUV.y, lFlags);
+  if (cpSaved)
+    {
+      rSurfaceNormal = *cpSaved;
+      return SM_SUCCESS;
+    }
+  SER(EvaluateNormalUnmemoized(crUV, bUFromLeft, bVFromLeft, rSurfaceNormal));
+  pMemo->sNormals.Insert(crUV.x, crUV.y, lFlags, &rSurfaceNormal);
+  return SM_SUCCESS;
+
+} // end SmSurface::EvaluateNormal
+
+/*******************************************************************//**
+PURPOSE: SmSurface::EvaluateNormal() without an active SmSurfaceEvaluationMemo.
+
+NOTES:
+***********************************************************************/
+SmStatus SmSurface::EvaluateNormalUnmemoized
   (const SmPoint2d & crUV,            // in : target domain point
    SmBoolean         bUFromLeft,      // in : if P is on U interval boundary
                                       //      TRUE  = evaluate P in upper interval where P is on the left of the interval
@@ -11461,7 +11671,7 @@ static constexpr ULONG lStackSize = 6 ;
 
   return SM_SUCCESS;
 
-} // end SmSurface::EvaluateNormal
+} // end SmSurface::EvaluateNormalUnmemoized
 
 /*******************************************************************//**
 PURPOSE: Evaluation of the normal section of the Second Fundamental

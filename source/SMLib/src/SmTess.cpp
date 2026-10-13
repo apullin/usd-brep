@@ -12051,6 +12051,9 @@ SmStatus SmTess::Phase2CreateFacePolygons
   if (!pSC)
     { return SM_ERR; }
 
+  // Triangulation evaluates normals and 1st derivatives at the same polygon vertices many times
+  SmSurfaceEvaluationMemo sEvaluationMemo(pFace->GetSurface());
+
   // Build TessSrfCache Tree, Imbed UVTrimCurves, Label TreeNodes Inside/Outside/OnBoundary.
   //  Phase 1 already built the TessSrfCache, so that step will be skipped.
   //  But the Imbedding of UVTrimCurves and Labeling of TreeNodes as In/Out/On needs to be done.
