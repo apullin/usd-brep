@@ -700,8 +700,20 @@ SmBoolean bDebugMe = FALSE ;
 
   rbExactConversion = TRUE ;
 
+  // Only parameters at an end knot can need the seam adjustments below,
+  // so check that before the more expensive IsClosed() evaluations.
+  SmBoolean bAtEndKnot = TRUE ;
+  if(m_vNaturalKnots.GetSize() > 0)
+    {
+      double dScaledZero =  (m_vNaturalKnots.GetLast() - m_vNaturalKnots[0])
+                           / 360.0
+                           * SM_EFF_ZERO_DEG ;
+      bAtEndKnot =    SM_ARE_SAME_TO_TOL(dNurbsParameter, m_vNaturalKnots[0],        dScaledZero)
+                   || SM_ARE_SAME_TO_TOL(dNurbsParameter, m_vNaturalKnots.GetLast(), dScaledZero) ;
+    }
+
   // make sure to return the proper end value for closed curve seam conversions
-  if(m_cpCurve->IsClosed(m_cpCurve->GetNaturalInterval()))
+  if(bAtEndKnot && m_cpCurve->IsClosed(m_cpCurve->GetNaturalInterval()))
     {
       SmBoolean bInsideOut = m_cpCurve->GetInsideOut() ;
       double dScaledZero   =  (m_vNaturalKnots.GetLast() - m_vNaturalKnots[0])
