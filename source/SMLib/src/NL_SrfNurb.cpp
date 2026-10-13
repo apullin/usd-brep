@@ -1828,6 +1828,273 @@ NL_NOINLINE NL_VOID N_ComputeDerivativeMatrix
 
 /*******************************************************************//**
 
+   DESCRIPTION:
+
+     Versions of N_SrfBasisDerivs and N_ComputeDerivativeMatrix used by
+     N_SrfDerivs for compile-time derivative requests, and for compile-time
+     degrees when P, Q >= 0. They perform the same floating-point operations
+     in the same order as the generic routines, so results are bit-identical;
+     only the storage is compact and more loop bounds are known at compile time.
+
+   ***********************************************************************/
+
+/* Same operations as N_ComputeBasisFunctions, N_ComputeDerivativesImpl and the
+   derivative scaling in N_SrfBasisDerivs, for one parameter direction. */
+template <int P, int UDR, int PM = (P >= 0 ? P : NL_MAXDEG)>
+static NL_INLINE NL_VOID N_BasisDerivsFixed
+ (NL_PARAMETER   u,                              // in : parameter value
+  const NL_REAL *U,                              // in : knot values
+  NL_INDEX       ks,                             // in : knot span from N_BasisFindSpan
+  NL_INDEX       udr_rt,                         // in : highest derivative required, <= NL_MAXDER; used when UDR < 0
+  NL_DEGREE      p_rt,                           // in : degree, <= NL_MAXDEG; used when P < 0
+  NL_REAL        (&DU)[NL_MAXDER + 1][PM + 1])   // out: DU[k][j] = k-th derivative of N[ks-p+j]
+{
+    const NL_INDEX udr = UDR >= 0 ? UDR : udr_rt;
+    const int p = P >= 0 ? P : p_rt;
+    NL_REAL ndu[PM + 1][PM + 1];
+    NL_REAL left[PM + 1], right[PM + 1];
+
+    ndu[0][0] = 1.0;
+    for (int j = 1; j <= p; j++)
+    {
+        left[j] = u - U[ks + 1 - j];
+        right[j] = U[ks + j] - u;
+        NL_REAL saved = 0.0;
+        for (int r = 0; r < j; r++)
+        {
+            ndu[j][r] = right[r + 1] + left[j - r];
+            NL_REAL temp = ndu[r][j - 1] / ndu[j][r];
+            ndu[r][j] = saved + right[r + 1] * temp;
+            saved = left[j - r] * temp;
+        }
+        ndu[j][j] = saved;
+    }
+
+    for (int j = 0; j <= p; j++)
+        DU[0][j] = ndu[j][p];
+    for (NL_INDEX k = p + 1; k <= udr; k++)
+        for (int j = 0; j <= p; j++)
+            DU[k][j] = 0.0;
+
+    const NL_INDEX mder = NL_MIN(p, udr);
+    if (mder == 0)
+        return;
+
+    NL_REAL a[2][PM + 1];
+    for (NL_INDEX r = 0; r <= p; r++)
+    {
+        NL_REAL* a_s1 = a[0];
+        NL_REAL* a_s2 = a[1];
+        a_s1[0] = 1.0;
+        for (NL_INDEX k = 1; k <= mder; k++)
+        {
+            NL_REAL dd = 0.0;
+            NL_INDEX rk = r - k;
+            NL_INDEX pk = p - k;
+            if (r >= k)
+            {
+                a_s2[0] = a_s1[0] / ndu[pk + 1][rk];
+                dd = a_s2[0] * ndu[rk][pk];
+            }
+            NL_INDEX j1 = (rk >= -1) ? 1 : -rk;
+            NL_INDEX j2 = ((r - 1) <= pk) ? (k - 1) : (p - r);
+            for (NL_INDEX j = j1; j <= j2; j++)
+            {
+                a_s2[j] = (a_s1[j] - a_s1[j - 1]) / ndu[pk + 1][rk + j];
+                dd += a_s2[j] * ndu[rk + j][pk];
+            }
+            if (r <= pk)
+            {
+                a_s2[k] = -a_s1[k - 1] / ndu[pk + 1][r];
+                dd += a_s2[k] * ndu[r][pk];
+            }
+            DU[k][r] = dd;
+            N_SwapRealPointers(&a_s1, &a_s2);
+        }
+    }
+
+    NL_INDEX r = p;
+    for (NL_INDEX k = 1; k <= mder; k++)
+    {
+        for (int j = 0; j <= p; j++)
+            DU[k][j] *= r;
+        r *= (p - k);
+    }
+}
+
+/* Same result as N_SrfBasisDerivs followed by N_ComputeDerivativeMatrix.
+   P, Q fix the degrees and UDR, VDR, UPPER the derivative request when >= 0;
+   requires udr, vdr <= NL_MAXDER. */
+template <int P, int Q, int UDR, int VDR, int UPPER,
+          int PM = (P >= 0 ? P : NL_MAXDEG), int QM = (Q >= 0 ? Q : NL_MAXDEG)>
+static NL_FLAG N_SrfDerivsFixed
+ (NL_SURFACE   *sur,
+  NL_PARAMETER  u,
+  NL_PARAMETER  v,
+  NL_FLAG       ufl,
+  NL_FLAG       vfl,
+  NL_FLAG       mfl,
+  NL_INDEX      udr_rt,
+  NL_INDEX      vdr_rt,
+  NL_POINT    **SD)
+{
+    NL_PRIVATE NL_STRING rname = _T("N_SrfBasisDerivs");
+    /* NL_PascalTri values, known at compile time */
+    static constexpr NL_INTEGER Pascal[NL_MAXDER + 1][NL_MAXDER + 1] =
+        { { 1 }, { 1, 1 }, { 1, 2, 1 }, { 1, 3, 3, 1 }, { 1, 4, 6, 4, 1 } };
+    const NL_INDEX udr = UDR >= 0 ? UDR : udr_rt;
+    const NL_INDEX vdr = VDR >= 0 ? VDR : vdr_rt;
+    const int p = P >= 0 ? P : sur->p;
+    const int q = Q >= 0 ? Q : sur->q;
+
+    NL_INDEX ku, kv;
+    NL_REAL DU[NL_MAXDER + 1][PM + 1];
+    NL_REAL DV[NL_MAXDER + 1][QM + 1];
+
+    if (N_BasisFindSpan(sur->knu, (NL_DEGREE)p, u, ufl, &ku) EQ NL_YES)
+        return NL_YES;
+    N_BasisDerivsFixed<P, UDR>(u, sur->knu->U, ku, udr, (NL_DEGREE)p, DU);
+
+    if (N_BasisFindSpan(sur->knv, (NL_DEGREE)q, v, vfl, &kv) EQ NL_YES)
+        return NL_YES;
+    N_BasisDerivsFixed<Q, VDR>(v, sur->knv->U, kv, vdr, (NL_DEGREE)q, DV);
+
+    NL_CPOINT** Pw = sur->net->Pw;
+    const NL_INDEX s1 = ku - p;
+    const NL_INDEX s2 = kv - q;
+    const NL_BOOLEAN noW = (Pw[0][0].w == NL_NOW);
+    const NL_BOOLEAN noZ = (Pw[0][0].z == NL_NOZ);
+    const NL_BOOLEAN upper = UPPER >= 0 ? UPPER : (mfl EQ NL_TRUE AND udr EQ vdr);
+
+    NL_POINT Pwl[PM + 1][QM + 1];
+    for (int i = 0; i <= p; i++)
+        for (int j = 0; j <= q; j++)
+            NI_CPtToPtEuclid_specialized(noZ, noW, Pw[s1 + i][s2 + j], &Pwl[i][j]);
+
+    if (noW)
+    {
+        for (NL_INDEX k = 0; k <= udr; k++)
+        {
+            for (NL_INDEX l = 0; l <= (upper ? (udr - k) : vdr); l++)
+            {
+                NL_POINT sd = {0, 0, 0};
+                for (int i = 0; i <= p; i++)
+                {
+                    for (int j = 0; j <= q; j++)
+                    {
+                        const NL_POINT& Pt = Pwl[i][j];
+                        NL_REAL alpha = DU[k][i] * DV[l][j];
+                        sd.x = alpha * Pt.x + sd.x;
+                        sd.y = alpha * Pt.y + sd.y;
+                        if (!noZ)
+                            sd.z = alpha * Pt.z + sd.z;
+                    }
+                }
+                SD[k][l] = sd;
+            }
+        }
+        return NL_NO;
+    }
+
+    /* Rational: derivatives of the denominator */
+    NL_REAL d[NL_MAXDER + 1][NL_MAXDER + 1];
+    for (NL_INDEX l = 0; l <= vdr; l++)
+    {
+        NL_REAL tu[PM + 1];
+        for (int i = 0; i <= p; i++)
+        {
+            tu[i] = 0.0;
+            for (int j = 0; j <= q; j++)
+                tu[i] += Pw[s1 + i][s2 + j].w * DV[l][j];
+        }
+        for (NL_INDEX k = 0; k <= udr; k++)
+        {
+            d[k][l] = 0.0;
+            for (int i = 0; i <= p; i++)
+                d[k][l] += tu[i] * DU[k][i];
+        }
+    }
+
+    if (N_FloatOpIsBad(1.0, d[0][0], NL_DIVISION))
+    {
+        N_ErrSet(NL_CON_ERR, rname);
+        return NL_YES;
+    }
+    const NL_REAL invW00 = 1.0 / d[0][0];
+
+    /* Rational basis derivatives RD[k][l][n][m], as in N_SrfBasisDerivs */
+    NL_REAL RD[NL_MAXDER + 1][NL_MAXDER + 1][PM + 1][QM + 1];
+    for (int n = 0; n <= p; n++)
+    {
+        for (int m = 0; m <= q; m++)
+        {
+            NL_REAL w = Pw[s1 + n][s2 + m].w;
+            for (NL_INDEX k = 0; k <= udr; k++)
+            {
+                for (NL_INDEX l = 0; l <= (upper ? (udr - k) : vdr); l++)
+                {
+                    NL_REAL v1 = w * DU[k][n] * DV[l][m];
+                    for (NL_INDEX j = 1; j <= l; j++)
+                        v1 -= Pascal[l][j] * d[0][j] * RD[k][l - j][n][m];
+                    for (NL_INDEX i = 1; i <= k; i++)
+                    {
+                        v1 -= Pascal[k][i] * d[i][0] * RD[k - i][l][n][m];
+                        NL_REAL v2 = 0.0;
+                        for (NL_INDEX j = 1; j <= l; j++)
+                            v2 += Pascal[l][j] * d[i][j] * RD[k - i][l - j][n][m];
+                        v1 -= Pascal[k][i] * v2;
+                    }
+                    RD[k][l][n][m] = v1 * invW00;
+                }
+            }
+        }
+    }
+
+    for (NL_INDEX k = 0; k <= udr; k++)
+    {
+        for (NL_INDEX l = 0; l <= (upper ? (udr - k) : vdr); l++)
+        {
+            NL_POINT sd = {0, 0, 0};
+            for (int i = 0; i <= p; i++)
+            {
+                for (int j = 0; j <= q; j++)
+                {
+                    const NL_POINT& Pt = Pwl[i][j];
+                    NL_REAL alpha = RD[k][l][i][j];
+                    sd.x = alpha * Pt.x + sd.x;
+                    sd.y = alpha * Pt.y + sd.y;
+                    if (!noZ)
+                        sd.z = alpha * Pt.z + sd.z;
+                }
+            }
+            SD[k][l] = sd;
+        }
+    }
+    return NL_NO;
+}
+
+/* Select compile-time derivative orders for the common requests. */
+template <int P, int Q>
+static NL_FLAG N_SrfDerivsDispatch
+ (NL_SURFACE *sur, NL_PARAMETER u, NL_PARAMETER v, NL_FLAG ufl, NL_FLAG vfl, NL_FLAG mfl,
+  NL_INDEX udr, NL_INDEX vdr, NL_POINT **SD)
+{
+    const NL_BOOLEAN upper = (mfl EQ NL_TRUE AND udr EQ vdr);
+    if (udr == 1 AND vdr == 1 AND upper)
+        return N_SrfDerivsFixed<P, Q, 1, 1, 1>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+    if (udr == 0 AND vdr == 1)
+        return N_SrfDerivsFixed<P, Q, 0, 1, 0>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+    if (udr == 1 AND vdr == 0)
+        return N_SrfDerivsFixed<P, Q, 1, 0, 0>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+    if (udr == 2 AND vdr == 2 AND upper)
+        return N_SrfDerivsFixed<P, Q, 2, 2, 1>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+    if (udr == 0 AND vdr == 0)
+        return N_SrfDerivsFixed<P, Q, 0, 0, -1>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+    return N_SrfDerivsFixed<P, Q, -1, -1, -1>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+}
+
+/*******************************************************************//**
+
 
    DESCRIPTION:
 
@@ -1929,6 +2196,36 @@ NL_FLAG N_SrfDerivs
     
     if( sur == NULL )
         NL_ERROR( NL_CAL_ERR );
+
+    /* Fast paths: compile-time degrees for the common low degrees */
+    if (udr LE NL_MAXDER AND vdr LE NL_MAXDER AND sur->p LE 3 AND sur->q LE 3)
+    {
+        switch (sur->p * 4 + sur->q)
+        {
+            case 1 * 4 + 1: return N_SrfDerivsDispatch<1, 1>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+            case 1 * 4 + 2: return N_SrfDerivsDispatch<1, 2>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+            case 1 * 4 + 3: return N_SrfDerivsDispatch<1, 3>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+            case 2 * 4 + 1: return N_SrfDerivsDispatch<2, 1>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+            case 2 * 4 + 2: return N_SrfDerivsDispatch<2, 2>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+            case 2 * 4 + 3: return N_SrfDerivsDispatch<2, 3>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+            case 3 * 4 + 1: return N_SrfDerivsDispatch<3, 1>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+            case 3 * 4 + 2: return N_SrfDerivsDispatch<3, 2>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+            case 3 * 4 + 3: return N_SrfDerivsDispatch<3, 3>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+            default: break;
+        }
+    }
+    else if (udr LE NL_MAXDER AND vdr LE NL_MAXDER AND sur->p GE 1 AND sur->q GE 1
+             AND sur->p LE NL_MAXDEG AND sur->q LE NL_MAXDEG)
+    {
+        /* Higher degrees: same operations with runtime degrees */
+        switch (sur->p)
+        {
+            case 1: return N_SrfDerivsDispatch<1, -1>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+            case 2: return N_SrfDerivsDispatch<2, -1>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+            case 3: return N_SrfDerivsDispatch<3, -1>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+            default: return N_SrfDerivsDispatch<-1, -1>(sur, u, v, ufl, vfl, mfl, udr, vdr, SD);
+        }
+    }
 
     /* Get local notation */
     p = sur->p;
