@@ -31,8 +31,18 @@
 #include <SmTopologyTraverser.h>
 #include <SmGap.h>
 #include <SmAssertArray.h>
+#include <SmTol.h>
+#include <SmEllipse.h>
+#include <SmSurfOfExtrusion.h>
+#include <SmSurfOfRevolution.h>
+#include <nurbs.h>
 // Remove Composites
 //  #include <SmCFace.h>
+
+#include <cstring>
+#include <functional>
+#include <unordered_map>
+#include <vector>
 
 //    // For debugging only - a set of pointers that can be assigned and inspected through the watch window
 //    #ifdef SM_DEBUG_CODE
@@ -1558,6 +1568,15 @@ SmValidityCheckType eCheckFailed ;
               if (ii == 0 || ii == 2)
               {
                   bDropCurveCalled = TRUE;
+                  // the first drop may have been computed ahead of time on a worker thread
+                  SmBoolean bPrecomputed =    ii == 0
+                                           && pOptDropCurveFail == NULL
+                                           && SmUVTrimCurvePrecompute::UseDrop(this, pSurface, pCurve, pContext, sFaceDomain,
+                                                                               sEdgeDomain, sZoneTol3d, rdMaxDistToSurf,
+                                                                               dMaxDropApproxDev, sUVCurves, pDropCurveFail,
+                                                                               lResult);
+                  if (!bPrecomputed)
+                  {
                   lResult = pSurface->DropCurve(*pContext,                 // in : context for new object construction
                                                 sFaceDomain,               // in : domain of interest for this surface
                                                 *pCurve,                   // in : Curve to project onto the surface
@@ -1579,6 +1598,7 @@ SmValidityCheckType eCheckFailed ;
                                                 pDropCurveFail);           // out: Optional data container for DropCurve diagnostics
                                                                            //      and recovery-path reporting,
                                                                            //      NUll to ignore, default:[NULL]
+                  }
               } // end (ii==0 || ii==2) - Try DropCurve branch
               else // (ii==1 || ii=3) - Try DropAndTrimCurve branch
               {
@@ -6690,3 +6710,680 @@ void SmEdgeuse::Dump() const
   smos_WriteBuffer( _T( "\nEnd SmEdgeuse::Dump()\n" ) );
 
 } // end SmEdgeuse::Dump( bAbbrev )
+
+/********************************************************************
+   SmUVTrimCurvePrecompute
+
+   SmEdgeuse::CreateUVTrimCurve() usually makes one SmSurface::DropCurve()
+   call per edgeuse, whose result depends only on the face surface, the
+   edge curve and its cache, the face domain, and the edge interval and
+   tolerance. Those calls are made on worker threads ahead of time:
+   each task drops one edge curve onto private copies of the surfaces
+   (made from master copies, as surface drops temporarily change the
+   surface and its cache) and may build the curve's cache, which only
+   depends on the curve and its edge tolerance. CreateUVTrimCurve()
+   adopts a result when all its inputs are unchanged, and then creates
+   the surface cache the drop would have created.
+*********************************************************************/
+namespace {
+
+// One SmSurface::DropCurve() call of SmEdgeuse::CreateUVTrimCurve()
+struct SmPrecomputedDrop
+{
+  // drop inputs, recorded by Prepare()
+  SmSurface         * pSurface            = NULL;   // face surface
+  size_t              lSurface            = 0;      // its index in SmUVTrimCurvePrecomputeData::sSurfaces
+  SmCurve           * pCurve              = NULL;   // edge curve
+  const SmContext   * cpContext           = NULL;   // face context
+  SmExtent2d          sFaceDomain;
+  SmExtent1d          sEdgeDomain;
+  SmZoneTol3d         sZoneTol3d;
+  const gw_SURFACE  * cpSurfaceNurb       = NULL;   // NURB data and out of bounds state of pSurface and pCurve
+  const gw_CURVE    * cpCurveNurb         = NULL;
+  SmBoolean           bSurfaceOutOfBounds = FALSE;
+  SmBoolean           bCurveOutOfBounds   = FALSE;
+
+  // results, set by ComputeTask()
+  SmBoolean           bComputed           = FALSE;
+  SmBoolean           bUsed               = FALSE;  // adopted or rejected by CreateUVTrimCurve()
+  SmStatus            eStatus             = SM_ERR;
+  double              dMaxDistToSurf      = 0.0;
+  double              dMaxApproxDev       = 0.0;
+  std::vector<SmBSplineCurve*> sUVCurves;           // owned until adopted
+  SmStatus            eFailStatus         = SM_SUCCESS;
+  ULONG               lFailFromCall       = 0;
+  SmCreateUVTrimCurvePathType eCreatePathType = SM_CTC_UNKNOWN;
+  SmBoolean           bMadeSurfaceCache   = FALSE;  // the drop created the surface's cache
+  SmBoolean           bBuiltSurfaceTree   = FALSE;  //   and built its tree
+  SmBoolean           bUsedCurveCache     = FALSE;  // the drop asked for the curve's cache
+};
+
+// Curve cache built by a task
+struct SmPrecomputedCurveCache
+{
+  const SmCacheObj  * cpCache    = NULL;
+  double              dApproxTol = 0.0;    // tolerance SmCurveCache::Tessellate() used
+  SmBoolean           bChecked   = FALSE;  // its first use checked dApproxTol
+  SmBoolean           bReplaced  = FALSE;  // dApproxTol had changed and the cache was rebuilt
+};
+
+struct SmUVTrimCurvePrecomputeData
+{
+  std::vector<SmPrecomputedDrop>                                 sDrops;
+  std::unordered_map<const SmEdgeuse *, size_t>                  sDropIndex;    // by sm_DropKey()
+  std::vector<size_t>                                            sTaskStarts;   // sTaskDrops of task i: [sTaskStarts[i], sTaskStarts[i+1])
+  std::vector<size_t>                                            sTaskDrops;    // drops of each edge curve, by task
+  std::vector<SmPrecomputedCurveCache>                           sTaskCaches;   // curve cache built by each task
+  std::vector<SmSurface*>                                        sSurfaces;     // face surfaces of the drops
+  std::vector<const SmContext *>                                 sContexts;     //   their face contexts
+  std::vector<SmSurface*>                                        sMasters;      //   their owned copies
+  std::unordered_map<const SmCurve *, SmPrecomputedCurveCache *> sCurveCaches;  // set by Activate()
+  const SmGeometryEditTracker                                  * cpEditTracker = NULL;
+};
+
+// precompute used by CreateUVTrimCurve() on the calling thread
+SM_THREAD_LOCAL SmUVTrimCurvePrecomputeData * t_pActiveUVTrimCurvePrecompute = NULL;
+
+// drop that a task computes on the calling thread, which notes curve cache requests;
+// set only while sm_ComputeDrop() runs
+SM_THREAD_LOCAL SmPrecomputedDrop * t_pComputingDrop = NULL;
+
+// an edgeuse and its mate share one UVTrimCurve and one drop
+const SmEdgeuse * sm_DropKey(const SmEdgeuse * cpEdgeuse)
+{
+  const SmEdgeuse * cpMate = cpEdgeuse->GetMate();
+  return (cpMate != NULL && std::less<const SmEdgeuse *>()(cpMate, cpEdgeuse)) ? cpMate : cpEdgeuse;
+}
+
+// approximation tolerance that SmCurveCache::Tessellate() uses for cpCurve
+double sm_CurveCacheApproxTol(const SmCurve * cpCurve)
+{
+  SmApproxTol3d dApproxTol = SmTol::GetApproxTol3d( cpCurve );
+  if ( dApproxTol < SM_EFF_ZERO )
+    { dApproxTol = SmTol::GetApproxTol3d( cpCurve->GetContext() ); }
+  return dApproxTol;
+}
+
+// TRUE when cpSurface has no cache, or one built without implanted UVTrimCurves
+SmBoolean sm_HasPlainSurfaceCache(const SmSurface * cpSurface)
+{
+  const SmSurfaceCache * cpSC = (const SmSurfaceCache *)cpSurface->GetCacheObj();
+  return (cpSC == NULL || !cpSC->m_bHaveTSurfaceCache) ? TRUE : FALSE;
+}
+
+template <class T>
+bool sm_SameBits(const T & crA, const T & crB)
+{
+  return std::memcmp(&crA, &crB, sizeof(T)) == 0;
+}
+
+// TRUE when copying cpCurve copies no attributes: the curve has none, and its class is one whose
+// copy constructor copies no other geometry
+SmBoolean sm_IsPlainCurve(const SmCurve * cpCurve)
+{
+  if (cpCurve == NULL)
+    { return TRUE; }
+  switch (cpCurve->GetType())
+    {
+      case SmBSplineCurve_TYPE:
+      case SmLine_TYPE:
+      case SmEllipse_TYPE:      // sets up its polar conversion with itself
+      case SmCircle_TYPE:
+      case SmParabola_TYPE:
+      case SmHyperbola_TYPE:
+        return cpCurve->HasAttributes() ? FALSE : TRUE;
+      default:
+        return FALSE;
+    }
+}
+
+// TRUE when copying cpSurface copies no attributes: the surface and the geometry its copy
+// constructor copies (generator curve, curve of the polar conversion) have none, and its class
+// is one whose copy constructor copies no other geometry
+SmBoolean sm_IsPlainSurface(const SmSurface * cpSurface)
+{
+  if (cpSurface->HasAttributes())
+    { return FALSE; }
+  switch (cpSurface->GetType())
+    {
+      case SmBSplineSurface_TYPE:
+      case SmPlane_TYPE:
+        return TRUE;
+      case SmSurfOfExtrusion_TYPE:
+        return sm_IsPlainCurve(((const SmSurfOfExtrusion *)cpSurface)->GetGenCurve());
+      case SmSurfOfRevolution_TYPE:
+      case SmCone_TYPE:
+      case SmCylinder_TYPE:
+      case SmSphere_TYPE:
+      case SmTorus_TYPE:
+        return (   sm_IsPlainCurve(((const SmSurfOfRevolution *)cpSurface)->GetGenCurve())
+                && sm_IsPlainCurve(((const SmSurfOfRevolution *)cpSurface)->GetPolarConversionCurve())) ? TRUE : FALSE;
+      default:
+        return FALSE;
+    }
+}
+
+// TRUE when two curves have bit-identical NURB data
+SmBoolean sm_IsSameNurb(const gw_CURVE * cpA, const gw_CURVE * cpB)
+{
+  return (   cpA != NULL
+          && cpB != NULL
+          && cpA->p == cpB->p
+          && cpA->knt->m == cpB->knt->m
+          && cpA->pol->n == cpB->pol->n
+          && std::memcmp(cpA->knt->U, cpB->knt->U, sizeof(cpA->knt->U[0]) * (cpA->knt->m + 1)) == 0
+          && std::memcmp(cpA->pol->Pw, cpB->pol->Pw, sizeof(cpA->pol->Pw[0]) * (cpA->pol->n + 1)) == 0) ? TRUE : FALSE;
+}
+
+// TRUE when two surfaces have bit-identical NURB data
+SmBoolean sm_IsSameNurb(const gw_SURFACE * cpA, const gw_SURFACE * cpB)
+{
+  if (   cpA == NULL
+      || cpB == NULL
+      || cpA->p != cpB->p
+      || cpA->q != cpB->q
+      || cpA->knu->m != cpB->knu->m
+      || cpA->knv->m != cpB->knv->m
+      || cpA->net->n != cpB->net->n
+      || cpA->net->m != cpB->net->m
+      || std::memcmp(cpA->knu->U, cpB->knu->U, sizeof(cpA->knu->U[0]) * (cpA->knu->m + 1)) != 0
+      || std::memcmp(cpA->knv->U, cpB->knv->U, sizeof(cpA->knv->U[0]) * (cpA->knv->m + 1)) != 0)
+    { return FALSE; }
+  for (NL_INDEX ii = 0; ii <= cpA->net->n; ii++)
+    {
+      if (std::memcmp(cpA->net->Pw[ii], cpB->net->Pw[ii], sizeof(cpA->net->Pw[ii][0]) * (cpA->net->m + 1)) != 0)
+        { return FALSE; }
+    }
+  return TRUE;
+}
+
+// TRUE when cpCopy, a copy of cpCurve, has the same shape data: copying can move clustered
+// knots (sm_FixupKnotVector()) and sets up the polar conversion of an ellipse again
+SmBoolean sm_IsSameCurveCopy(const SmCurve * cpCurve, const SmCurve * cpCopy)
+{
+  if (cpCurve == NULL || cpCopy == NULL)
+    { return (cpCurve == cpCopy) ? TRUE : FALSE; }
+  const SmBSplineCurve * cpBSC     = SM_CAST_PTR(SmBSplineCurve, (SmCurve *)cpCurve);
+  const SmBSplineCurve * cpBSCCopy = SM_CAST_PTR(SmBSplineCurve, (SmCurve *)cpCopy);
+  if (   cpBSC == NULL
+      || cpBSCCopy == NULL
+      || cpBSC->GetType() != cpBSCCopy->GetType()
+      || cpBSC->IsOutOfBoundsEnabled() != cpBSCCopy->IsOutOfBoundsEnabled()
+      || !sm_IsSameNurb(cpBSC->GetGwNurbPointer(), cpBSCCopy->GetGwNurbPointer()))
+    { return FALSE; }
+  const SmEllipse * cpEllipse = SM_CAST_PTR(SmEllipse, (SmCurve *)cpCurve);
+  if (   cpEllipse != NULL
+      && !sm_SameBits(cpEllipse->GetSTEPInterval(), ((const SmEllipse *)cpCopy)->GetSTEPInterval()))
+    { return FALSE; }
+  return TRUE;
+}
+
+// TRUE when pCopy, a copy of pSurface, has the same shape data and point solvers: copying can
+// move clustered knots (sm_FixupKnotVector()), copies the generator curves and resets the solvers
+SmBoolean sm_IsSameSurfaceCopy(SmBSplineSurface * pSurface, SmBSplineSurface * pCopy)
+{
+  if (   pCopy == NULL
+      || pSurface->GetType() != pCopy->GetType()
+      || pSurface->IsUsingNewPointSolvers() != pCopy->IsUsingNewPointSolvers()
+      || pSurface->GetOutOfBoundsEnabled() != pCopy->GetOutOfBoundsEnabled()
+      || !sm_IsSameNurb(pSurface->GetGwNurbPointer(), pCopy->GetGwNurbPointer()))
+    { return FALSE; }
+  const SmSurfOfRevolution * cpRevolution = SM_CAST_PTR(SmSurfOfRevolution, pSurface);
+  if (cpRevolution != NULL)
+    {
+      const SmSurfOfRevolution * cpRevolutionCopy = (const SmSurfOfRevolution *)pCopy;
+      return (   sm_IsSameCurveCopy(cpRevolution->GetGenCurve(), cpRevolutionCopy->GetGenCurve())
+              && sm_IsSameCurveCopy(cpRevolution->GetPolarConversionCurve(), cpRevolutionCopy->GetPolarConversionCurve())) ? TRUE : FALSE;
+    }
+  const SmSurfOfExtrusion * cpExtrusion = SM_CAST_PTR(SmSurfOfExtrusion, pSurface);
+  if (cpExtrusion != NULL)
+    { return sm_IsSameCurveCopy(cpExtrusion->GetGenCurve(), ((const SmSurfOfExtrusion *)pCopy)->GetGenCurve()); }
+  return TRUE;
+}
+
+} // end anonymous namespace
+
+/*******************************************************************//**
+PURPOSE: Constructor
+
+NOTES:
+***********************************************************************/
+SmUVTrimCurvePrecompute::SmUVTrimCurvePrecompute()
+ : m_pData(new SmUVTrimCurvePrecomputeData),
+   m_pPrevious(NULL)
+{
+} // end SmUVTrimCurvePrecompute::SmUVTrimCurvePrecompute
+
+/*******************************************************************//**
+PURPOSE: Stop using the results; delete unused results, master surfaces,
+   and curve caches that tasks built and nothing used.
+
+NOTES: Allocates nothing and runs no TBB algorithm, so it doesn't throw.
+***********************************************************************/
+SmUVTrimCurvePrecompute::~SmUVTrimCurvePrecompute()
+{
+  SmUVTrimCurvePrecomputeData * pData = (SmUVTrimCurvePrecomputeData *)m_pData;
+  if (t_pActiveUVTrimCurvePrecompute == pData)
+    { t_pActiveUVTrimCurvePrecompute = (SmUVTrimCurvePrecomputeData *)m_pPrevious; }
+
+  // the serial code would not have built these curve caches
+  for (size_t lTask = 0; lTask < pData->sTaskCaches.size(); lTask++)
+    {
+      const SmPrecomputedCurveCache & crCache = pData->sTaskCaches[lTask];
+      SmCurve * pCurve = pData->sDrops[pData->sTaskDrops[pData->sTaskStarts[lTask]]].pCurve;
+      if (   crCache.cpCache != NULL
+          && !crCache.bChecked
+          && (pData->cpEditTracker == NULL || !pData->cpEditTracker->WasEdited(pCurve))
+          && pCurve->GetCacheObj() == crCache.cpCache)
+        { SmCacheMgr::DeleteObjectsCache(SM_OC_CURVE, pCurve); }
+    }
+
+  // private objects: unused results and surface copies
+  for (SmPrecomputedDrop & rDrop : pData->sDrops)
+    {
+      for (SmBSplineCurve * pUVCurve : rDrop.sUVCurves)
+        { delete pUVCurve; }
+    }
+  for (SmSurface * pMaster : pData->sMasters)
+    { delete pMaster; }
+  delete pData;
+
+} // end SmUVTrimCurvePrecompute::~SmUVTrimCurvePrecompute
+
+/*******************************************************************//**
+PURPOSE: Pick the drops CreateUVTrimCurve() will make for the faces'
+   edgeuses without UVTrimCurves and record their inputs.
+
+NOTES: Only BSpline based geometry whose NURB data exists is used, so
+   that copying and evaluating it does not change it, only geometry
+   whose copies copy no attributes (shared attribute objects aren't
+   thread-safe), only edge curves owned by their edges, whose tolerance
+   the drops look up, and only geometry in the face's context, which
+   copies of it are made in.
+***********************************************************************/
+void SmUVTrimCurvePrecompute::Prepare
+ (const SmTArray<SmFace*> & crFaces)   // in : faces to be tessellated, NULL entries are skipped
+{
+  SmUVTrimCurvePrecomputeData * pData = (SmUVTrimCurvePrecomputeData *)m_pData;
+  std::unordered_map<const SmSurface *, size_t> sSurfaceIndex;
+  std::unordered_map<const SmCurve *, size_t>   sCurveTasks;
+  std::vector<size_t>                           sDropTasks;   // task of each drop
+  SM_PTR_ARRAY(sLoopuses, SmLoopuse, 64) ;  // SmTArray<SmLoopuse *>
+  SM_PTR_ARRAY(sEdgeuses, SmEdgeuse, 256) ; // SmTArray<SmEdgeuse *>
+  sSurfaceIndex.reserve(crFaces.GetSize());
+  sCurveTasks.reserve(crFaces.GetSize() * 4);
+  pData->sDropIndex.reserve(crFaces.GetSize() * 4);
+  pData->sDrops.reserve(crFaces.GetSize() * 4);
+
+  for (ULONG ii = 0; ii < crFaces.GetSize(); ii++)
+    {
+      SmFace           * pFace = crFaces[ii];
+      SmBSplineSurface * pBSS  = pFace ? SM_CAST_PTR(SmBSplineSurface, pFace->GetSurface()) : NULL;
+      if (   pBSS == NULL
+          || pBSS->GetGwNurbPointer() == NULL
+          || !sm_IsPlainSurface(pBSS)
+          || pBSS->GetOwner() != pFace
+          || pBSS->GetContext() != pFace->GetContext()
+          || !sm_HasPlainSurfaceCache(pBSS))
+        { continue; }
+
+      pFace->GetUpwardLoopuses(sLoopuses);
+      for (ULONG jj = 0; jj < sLoopuses.GetSize(); jj++)
+        {
+          sLoopuses[jj]->GetEdgeuses(sEdgeuses);
+          for (ULONG kk = 0; kk < sEdgeuses.GetSize(); kk++)
+            {
+              SmEdgeuse * pEU = sEdgeuses[kk];
+              if (pEU->GetUVTrimCurve() != NULL)
+                { continue; }
+              SmEdge         * pEdge = pEU->GetEdge();
+              SmBSplineCurve * pBSC  = pEdge ? SM_CAST_PTR(SmBSplineCurve, pEdge->GetCurve()) : NULL;
+              if (   pBSC == NULL
+                  || pBSC->GetGwNurbPointer() == NULL
+                  || !sm_IsPlainCurve(pBSC)
+                  || pBSC->GetOwner() != pEdge
+                  || pBSC->GetContext() != pFace->GetContext()
+                  || !pData->sDropIndex.emplace(sm_DropKey(pEU), pData->sDrops.size()).second)
+                { continue; }
+
+              auto sSurface = sSurfaceIndex.find(pBSS);
+              if (sSurface == sSurfaceIndex.end())
+                {
+                  sSurface = sSurfaceIndex.emplace(pBSS, pData->sSurfaces.size()).first;
+                  pData->sSurfaces.push_back(pBSS);
+                  pData->sContexts.push_back(pFace->GetContext());
+                }
+
+              SmPrecomputedDrop sDrop;
+              sDrop.pSurface            = pBSS;
+              sDrop.lSurface            = sSurface->second;
+              sDrop.pCurve              = pBSC;
+              sDrop.cpContext           = pFace->GetContext();
+              sDrop.sFaceDomain         = pFace->GetUVDomain();
+              sDrop.sEdgeDomain         = pEdge->GetInterval();
+              sDrop.sZoneTol3d          = pEdge->GetTolerance();
+              sDrop.cpSurfaceNurb       = pBSS->GetGwNurbPointer();
+              sDrop.cpCurveNurb         = pBSC->GetGwNurbPointer();
+              sDrop.bSurfaceOutOfBounds = pBSS->GetOutOfBoundsEnabled();
+              sDrop.bCurveOutOfBounds   = pBSC->GetOutOfBoundsEnabled();
+
+              pData->sDrops.push_back(sDrop);
+              sDropTasks.push_back(sCurveTasks.emplace(pBSC, sCurveTasks.size()).first->second);
+            } // end iter every edgeuse
+        } // end iter every loopuse
+    } // end iter every face
+
+  // group the drops by task, keeping their order
+  size_t lNumTasks = sCurveTasks.size();
+  pData->sTaskStarts.assign(lNumTasks + 1, 0);
+  for (size_t lTask : sDropTasks)
+    { pData->sTaskStarts[lTask + 1]++; }
+  for (size_t lTask = 0; lTask < lNumTasks; lTask++)
+    { pData->sTaskStarts[lTask + 1] += pData->sTaskStarts[lTask]; }
+  pData->sTaskDrops.resize(sDropTasks.size());
+  std::vector<size_t> sNext(pData->sTaskStarts.begin(), pData->sTaskStarts.end() - 1);
+  for (size_t lDrop = 0; lDrop < sDropTasks.size(); lDrop++)
+    { pData->sTaskDrops[sNext[sDropTasks[lDrop]]++] = lDrop; }
+
+  pData->sTaskCaches.resize(lNumTasks);
+  pData->sMasters.assign(pData->sSurfaces.size(), NULL);
+
+} // end SmUVTrimCurvePrecompute::Prepare
+
+/*******************************************************************//**
+PURPOSE: Number of face surfaces to copy
+
+NOTES:
+***********************************************************************/
+size_t SmUVTrimCurvePrecompute::GetSurfaceCount() const
+{
+  return ((const SmUVTrimCurvePrecomputeData *)m_pData)->sSurfaces.size();
+
+} // end SmUVTrimCurvePrecompute::GetSurfaceCount
+
+/*******************************************************************//**
+PURPOSE: Make the master copy of one face surface.
+
+NOTES: Thread-safe for distinct surfaces: copying and comparing only
+   read the surface, whose NURB data exists, and nothing writes it
+   meanwhile. No master is kept when the copy differs from the surface.
+***********************************************************************/
+void SmUVTrimCurvePrecompute::CopySurface
+ (size_t lSurface)   // in : surface index < GetSurfaceCount()
+{
+  SmUVTrimCurvePrecomputeData * pData    = (SmUVTrimCurvePrecomputeData *)m_pData;
+  SmBSplineSurface            * pSurface = SM_CAST_PTR(SmBSplineSurface, pData->sSurfaces[lSurface]);
+  SmSurface                   * pMaster  = NULL;
+  if (pSurface->Copy(*pData->sContexts[lSurface], pMaster) != SM_SUCCESS)
+    { return; }
+
+  // drops onto a copy that differs from the face surface would differ from the serial drops
+  if (sm_IsSameSurfaceCopy(pSurface, SM_CAST_PTR(SmBSplineSurface, pMaster)))
+    { pData->sMasters[lSurface] = pMaster; }
+  else
+    { delete pMaster; }
+
+} // end SmUVTrimCurvePrecompute::CopySurface
+
+/*******************************************************************//**
+PURPOSE: Number of tasks
+
+NOTES:
+***********************************************************************/
+size_t SmUVTrimCurvePrecompute::GetTaskCount() const
+{
+  return ((const SmUVTrimCurvePrecomputeData *)m_pData)->sTaskCaches.size();
+
+} // end SmUVTrimCurvePrecompute::GetTaskCount
+
+namespace {
+
+/*******************************************************************//**
+PURPOSE: Compute one drop of a task.
+
+NOTES: See SmUVTrimCurvePrecompute::ComputeTask().
+***********************************************************************/
+void sm_ComputeDrop
+ (SmUVTrimCurvePrecomputeData & rData,   // in : precompute
+  SmPrecomputedDrop           & rDrop)   // in,out: drop inputs and results
+{
+  const SmSurface * cpMaster = rData.sMasters[rDrop.lSurface];
+  SmSurface       * pSurface = NULL;
+  if (cpMaster == NULL)
+    { return; }
+
+  if (cpMaster->Copy(*rDrop.cpContext, pSurface) != SM_SUCCESS || pSurface == NULL)
+    { return; }
+  SmObjDelete sClean(pSurface);
+
+  // the same call as CreateUVTrimCurve()
+  SmDropCurveFail               sDropCurveFail;
+  SmTArray<SmBSplineCurve*>     sUVCurves;
+  SmObjsDelete<SmBSplineCurve*> sCleanUVCurves(&sUVCurves);  // until rDrop owns them
+  {
+    SmTemporaryChangeValue<SmPrecomputedDrop *> sComputingDrop(t_pComputingDrop, &rDrop);
+    rDrop.eStatus = pSurface->DropCurve(*rDrop.cpContext,
+                                        rDrop.sFaceDomain,
+                                        *rDrop.pCurve,
+                                        rDrop.sEdgeDomain,
+                                        (SmApproxTol3d)rDrop.sZoneTol3d,
+                                        rDrop.dMaxDistToSurf,
+                                        rDrop.dMaxApproxDev,
+                                        sUVCurves,
+                                        FALSE,
+                                        &sDropCurveFail);
+  }
+  rDrop.sUVCurves.assign(sUVCurves.GetDataArray(), sUVCurves.GetDataArray() + sUVCurves.GetSize());
+  sCleanUVCurves.Clear();
+
+  const SmSurfaceCache * cpSC = (const SmSurfaceCache *)pSurface->GetCacheObj();
+  rDrop.eFailStatus       = sDropCurveFail.m_sFailStatus;
+  rDrop.lFailFromCall     = sDropCurveFail.m_lFromCall;
+  rDrop.eCreatePathType   = sDropCurveFail.m_eCreatePathType;
+  rDrop.bMadeSurfaceCache = cpSC != NULL;
+  rDrop.bBuiltSurfaceTree = cpSC != NULL && cpSC->HasTree();
+  rDrop.bComputed         = TRUE;
+
+} // end sm_ComputeDrop
+
+} // end anonymous namespace
+
+/*******************************************************************//**
+PURPOSE: Compute the drops of one edge curve.
+
+NOTES: Thread-safe for distinct tasks: the curve belongs to this task
+   alone and the surfaces are private copies of the master copies.
+***********************************************************************/
+void SmUVTrimCurvePrecompute::ComputeTask
+ (size_t lTask)   // in : task index < GetTaskCount()
+{
+  SmUVTrimCurvePrecomputeData * pData   = (SmUVTrimCurvePrecomputeData *)m_pData;
+  size_t                        lBegin  = pData->sTaskStarts[lTask];
+  size_t                        lEnd    = pData->sTaskStarts[lTask + 1];
+  SmCurve                     * pCurve  = pData->sDrops[pData->sTaskDrops[lBegin]].pCurve;
+  const SmCacheObj            * cpOldCurveCache = pCurve->GetCacheObj();
+
+  for (size_t ii = lBegin; ii < lEnd; ii++)
+    { sm_ComputeDrop(*pData, pData->sDrops[pData->sTaskDrops[ii]]); }
+
+  // remember a curve cache built here, and the tolerance it was built with
+  const SmCacheObj * cpCurveCache = pCurve->GetCacheObj();
+  if (cpCurveCache != NULL && cpCurveCache != cpOldCurveCache)
+    {
+      pData->sTaskCaches[lTask].cpCache    = cpCurveCache;
+      pData->sTaskCaches[lTask].dApproxTol = sm_CurveCacheApproxTol(pCurve);
+    }
+
+} // end SmUVTrimCurvePrecompute::ComputeTask
+
+/*******************************************************************//**
+PURPOSE: Use the results on the calling thread.
+
+NOTES:
+***********************************************************************/
+void SmUVTrimCurvePrecompute::Activate
+ (SmGeometryEditTracker * pEditTracker)   // in : made after the tasks ran, watches the drop inputs
+{
+  SmUVTrimCurvePrecomputeData * pData = (SmUVTrimCurvePrecomputeData *)m_pData;
+  pData->cpEditTracker = pEditTracker;
+  for (const SmPrecomputedDrop & crDrop : pData->sDrops)
+    {
+      pEditTracker->Watch(crDrop.pSurface);
+      pEditTracker->Watch(crDrop.pCurve);
+    }
+  for (size_t lTask = 0; lTask < pData->sTaskCaches.size(); lTask++)
+    {
+      if (pData->sTaskCaches[lTask].cpCache != NULL)
+        { pData->sCurveCaches[pData->sDrops[pData->sTaskDrops[pData->sTaskStarts[lTask]]].pCurve] = &pData->sTaskCaches[lTask]; }
+    }
+  m_pPrevious = t_pActiveUVTrimCurvePrecompute;
+  t_pActiveUVTrimCurvePrecompute = pData;
+
+} // end SmUVTrimCurvePrecompute::Activate
+
+/*******************************************************************//**
+PURPOSE: Check a curve cache when it is about to be used: FALSE when a
+   task built cpOldCache with a tolerance that has changed since, so the
+   cache must be rebuilt as the serial code would build it now.
+
+NOTES: Also notes curve cache requests of the drops tasks compute.
+   Called by SmCurve::CacheMakeOrValidate().
+***********************************************************************/
+SmBoolean sm_CheckPrecomputedCurveCache
+ (const SmAObject  * cpObject,     // in : curve whose cache is requested
+  const SmCacheObj * cpOldCache)   // in : its existing cache or NULL
+{
+  const SmCurve * cpCurve = static_cast<const SmCurve *>(cpObject);
+  SmPrecomputedDrop * pComputingDrop = t_pComputingDrop;
+  if (pComputingDrop != NULL)
+    {
+      if (pComputingDrop->pCurve == cpCurve)
+        { pComputingDrop->bUsedCurveCache = TRUE; }
+      return TRUE;
+    }
+
+  SmUVTrimCurvePrecomputeData * pData = t_pActiveUVTrimCurvePrecompute;
+  if (pData == NULL || cpOldCache == NULL)
+    { return TRUE; }
+  auto sEntry = pData->sCurveCaches.find(cpCurve);
+  if (sEntry == pData->sCurveCaches.end() || sEntry->second->bChecked)
+    { return TRUE; }
+
+  SmPrecomputedCurveCache & rCache = *sEntry->second;
+  rCache.bChecked = TRUE;
+  if (   rCache.cpCache != cpOldCache
+      || pData->cpEditTracker->WasEdited(cpCurve)
+      || sm_SameBits(rCache.dApproxTol, sm_CurveCacheApproxTol(cpCurve)))
+    { return TRUE; }
+  rCache.bReplaced = TRUE;
+  return FALSE;
+
+} // end sm_CheckPrecomputedCurveCache
+
+/*******************************************************************//**
+PURPOSE: In place of CreateUVTrimCurve()'s first DropCurve() call, use
+   the drop computed for cpEdgeuse when its inputs are unchanged.
+
+RETURN: TRUE = outputs set as DropCurve() would set them,
+        FALSE= the caller must drop the curve itself.
+
+NOTES: A drop is offered once. The surface cache the drop would have
+   created is created, under the same temporary settings.
+***********************************************************************/
+SmBoolean SmUVTrimCurvePrecompute::UseDrop
+ (const SmEdgeuse            * cpEdgeuse,        // in : edgeuse creating its UVTrimCurve
+  SmSurface                  * pSurface,         // in : face surface, owner temporarily NULL
+  const SmCurve              * cpCurve,          // in : edge curve
+  const SmContext            * cpContext,        // in : face context
+  const SmExtent2d           & crFaceDomain,     // in : face domain
+  const SmExtent1d           & crEdgeDomain,     // in : edge interval
+  SmZoneTol3d                  sZoneTol3d,       // in : edge tolerance
+  double                     & rdMaxDistToSurf,  // out: as DropCurve()
+  double                     & rdMaxApproxDev,   // out: as DropCurve()
+  SmTArray<SmBSplineCurve*>  & rUVCurves,        // out: as DropCurve()
+  SmDropCurveFail            * pDropCurveFail,   // out: as DropCurve()
+  SmStatus                   & reStatus)         // out: DropCurve() return value
+{
+  SmUVTrimCurvePrecomputeData * pData = t_pActiveUVTrimCurvePrecompute;
+  if (pData == NULL)
+    { return FALSE; }
+  auto sIndex = pData->sDropIndex.find(sm_DropKey(cpEdgeuse));
+  if (sIndex == pData->sDropIndex.end())
+    { return FALSE; }
+  SmPrecomputedDrop & rDrop = pData->sDrops[sIndex->second];
+  if (rDrop.bUsed || !rDrop.bComputed)
+    { return FALSE; }
+  rDrop.bUsed = TRUE;
+
+  // inputs must be unchanged
+  const SmGeometryEditTracker * cpEditTracker = pData->cpEditTracker;
+  SmBSplineSurface            * pBSS = SM_CAST_PTR(SmBSplineSurface, pSurface);
+  SmBSplineCurve              * pBSC = SM_CAST_PTR(SmBSplineCurve, (SmCurve *)cpCurve);
+  if (   pBSS == NULL
+      || pBSC == NULL
+      || pBSS != rDrop.pSurface
+      || pBSC != rDrop.pCurve
+      || cpContext != rDrop.cpContext
+      || !sm_SameBits(crFaceDomain, rDrop.sFaceDomain)
+      || !sm_SameBits(crEdgeDomain, rDrop.sEdgeDomain)
+      || !sm_SameBits(sZoneTol3d.val, rDrop.sZoneTol3d.val)
+      || cpEditTracker->WasEdited(pBSS)
+      || cpEditTracker->WasEdited(pBSC)
+      || pBSS->GetGwNurbPointer() != rDrop.cpSurfaceNurb
+      || pBSC->GetGwNurbPointer() != rDrop.cpCurveNurb
+      || pBSS->GetOutOfBoundsEnabled() != rDrop.bSurfaceOutOfBounds
+      || pBSC->GetOutOfBoundsEnabled() != rDrop.bCurveOutOfBounds
+      || pBSS->HasAttributes()
+      || pBSC->HasAttributes()
+      || pBSS->GetOwner() != NULL
+      || !sm_HasPlainSurfaceCache(pBSS))
+    { return FALSE; }
+
+  // a curve cache built by the task must be the one the drop would use now
+  if (rDrop.bUsedCurveCache)
+    {
+      auto sEntry = pData->sCurveCaches.find(pBSC);
+      if (sEntry != pData->sCurveCaches.end())
+        {
+          if (sEntry->second->bReplaced || pBSC->GetCacheObj() != sEntry->second->cpCache)
+            { return FALSE; }
+          if (!sm_CheckPrecomputedCurveCache(pBSC, sEntry->second->cpCache))
+            {
+              SmCacheMgr::DeleteObjectsCache(SM_OC_CURVE, pBSC);
+              return FALSE;
+            }
+        }
+    }
+
+  // create the surface cache as SmSurface::DropCurve() would
+  if (rDrop.bMadeSurfaceCache)
+    {
+      SmTemporaryChangeValue<SmBoolean> sClean0(pBSS->GetOutOfBoundsEnabled(), TRUE);
+      SmSurfaceCache * pSC = smsurf_GetSurfaceCache(pBSS);
+      SmCacheCheckOutIn sCheckIO(pSC);
+      SmBoolean bTempBool = TRUE;
+      SmTemporaryChangeValue<SmBoolean> sChange1(pSC ? pSC->m_bPointTestEnabled      : bTempBool, FALSE);
+      SmTemporaryChangeValue<SmBoolean> sChange2(pSC ? pSC->m_bProcessBoundaryCurves : bTempBool, TRUE);
+      if (pSC && rDrop.bBuiltSurfaceTree)
+        { pSC->GetTree(); }
+    }
+
+  // set outputs, handing over each curve before it is added
+  rUVCurves.ReSet();
+  for (SmBSplineCurve *& rpUVCurve : rDrop.sUVCurves)
+    {
+      SmBSplineCurve * pUVCurve = rpUVCurve;
+      rpUVCurve = NULL;
+      rUVCurves.Add(pUVCurve);
+    }
+  rDrop.sUVCurves.clear();
+  rdMaxDistToSurf = rDrop.dMaxDistToSurf;
+  rdMaxApproxDev  = rDrop.dMaxApproxDev;
+  reStatus        = rDrop.eStatus;
+  pDropCurveFail->UnInit();
+  pDropCurveFail->m_sFailStatus     = rDrop.eFailStatus;
+  pDropCurveFail->m_lFromCall       = rDrop.lFailFromCall;
+  pDropCurveFail->m_eCreatePathType = rDrop.eCreatePathType;
+  return TRUE;
+
+} // end SmUVTrimCurvePrecompute::UseDrop

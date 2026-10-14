@@ -239,6 +239,7 @@ public:
   SmPoint3d                GetZAxis()               const { return m_vPosition.GetZAxis () ; }
 
   SmBoolean HavePolarConversion() const { return m_vPolarConverter.IsPolarConversionPossible() ; }
+  const SmEllipse * GetPolarConversionCurve() const { return m_vPolarConverter.GetCurve() ; }
 
   virtual SmStatus ConvertUVFromSTEPToNURBS
   (

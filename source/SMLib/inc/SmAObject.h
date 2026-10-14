@@ -179,6 +179,10 @@ private:
   void * m_pPrevious;  // tracker that was active before this one
 } ;
 
+// called by SmCurve::CacheMakeOrValidate(): FALSE when cpOldCache, the cache of cpCurve, was built
+// ahead of time on a worker thread (SmUVTrimCurvePrecompute) with a tolerance that has changed since
+SmBoolean sm_CheckPrecomputedCurveCache(const SmAObject * cpCurve, const SmCacheObj * cpOldCache);
+
 #endif // !__SMAOBJECT_H__
 
 

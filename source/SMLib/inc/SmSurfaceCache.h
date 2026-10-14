@@ -794,6 +794,9 @@ public:
 
   SmTree * GetTree();
 
+  // TRUE when the tree has been built (GetTree() builds it when needed)
+  SmBoolean HasTree() const { return m_pTree != NULL; }
+
   SmStatus GetCorners
   (
     gw_SURFACE       * pGWSurface,      ///< [in ]: optional Surface to check                                 <br>

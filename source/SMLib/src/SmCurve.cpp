@@ -9836,6 +9836,13 @@ SmBoolean bDebugMe = FALSE ;
   if (eObjectCacheType != SM_OC_CURVE) 
     { return SM_ERR; }
 
+  // rebuild a cache built ahead of time (SmUVTrimCurvePrecompute) whose tolerance changed since
+  if (!sm_CheckPrecomputedCurveCache(cpObject, cpOldCache))
+    {
+      SmCacheMgr::DeleteObjectsCache(SM_OC_CURVE, cpObject);
+      cpOldCache = NULL;
+    }
+
   // low work - use OldCache when its given
   if (cpOldCache) 
     {

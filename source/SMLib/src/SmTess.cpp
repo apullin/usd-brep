@@ -111,6 +111,21 @@ SmBoolean sm_IsPrebuiltFaceCacheCurrent(const SmPrebuiltFaceCache & crPrebuilt, 
           && !crEditTracker.WasEdited(pBSS)) ? TRUE : FALSE;
 }
 
+// copies the surfaces and runs the tasks of an SmUVTrimCurvePrecompute on worker threads
+void sm_ComputeUVTrimCurveTasks(SmUVTrimCurvePrecompute & rPrecompute)
+{
+  sm_ParallelFor(tbb::blocked_range<size_t>(0, rPrecompute.GetSurfaceCount(), 1), [&](const tbb::blocked_range<size_t> & crRange)
+    {
+      for (size_t kk = crRange.begin(); kk != crRange.end(); ++kk)
+        { rPrecompute.CopySurface(kk); }
+    });
+  sm_ParallelFor(tbb::blocked_range<size_t>(0, rPrecompute.GetTaskCount(), 1), [&](const tbb::blocked_range<size_t> & crRange)
+    {
+      for (size_t kk = crRange.begin(); kk != crRange.end(); ++kk)
+        { rPrecompute.ComputeTask(kk); }
+    });
+}
+
 } // end anonymous namespace
 #endif // !SM_USE_TBB
 
@@ -12227,9 +12242,11 @@ SmStatus SmTess::Phase1SetupBrep
   #else
   // Phase 1 work computed on worker threads first and adopted below when its inputs
   // are unchanged: the surface tessellation caches of BSpline faces (CreateFaceTessCache()
-  // only reads the face's surface).
+  // only reads the face's surface) and the first SmSurface::DropCurve() call of each
+  // UVTrimCurve (SmUVTrimCurvePrecompute).
   std::vector<SmPrebuiltFaceCache>         sPrebuiltCaches;
   std::unique_ptr<SmGeometryEditTracker>   pEditTracker;            // edits made after the worker threads ran
+  std::unique_ptr<SmUVTrimCurvePrecompute> pUVTrimCurvePrecompute;  // destroyed before pEditTracker
   const SmBoolean bPrecompute = sFaces.GetSize() > 1 && sm_UsePhase1Precompute(m_crContext, m_rSurfaceTess, sFaces);
   if (bPrecompute)
     {
@@ -12247,19 +12264,31 @@ SmStatus SmTess::Phase1SetupBrep
               sPrebuiltCaches[ii].bOutOfBounds = pBSS->GetOutOfBoundsEnabled();
             }
         }
-      sm_ParallelFor(tbb::blocked_range<ULONG>(0, sFaces.GetSize(), 1), [&](const tbb::blocked_range<ULONG> & crRange)
+      pUVTrimCurvePrecompute.reset(new SmUVTrimCurvePrecompute);
+      pUVTrimCurvePrecompute->Prepare(sFaces);
+
+      sm_ParallelInvoke(
+        [&]
         {
-          for (ULONG kk = crRange.begin(); kk != crRange.end(); ++kk)
+          sm_ParallelFor(tbb::blocked_range<ULONG>(0, sFaces.GetSize(), 1), [&](const tbb::blocked_range<ULONG> & crRange)
             {
-              SmTessSrfCache * pSC = NULL;
-              if (sPrebuiltCaches[kk].cpSurface && CreateFaceTessCache(sFaces[kk], pSC) == SM_SUCCESS)
-                { sPrebuiltCaches[kk].pSC.reset(pSC); }
-            }
+              for (ULONG kk = crRange.begin(); kk != crRange.end(); ++kk)
+                {
+                  SmTessSrfCache * pSC = NULL;
+                  if (sPrebuiltCaches[kk].cpSurface && CreateFaceTessCache(sFaces[kk], pSC) == SM_SUCCESS)
+                    { sPrebuiltCaches[kk].pSC.reset(pSC); }
+                }
+            });
+        },
+        [&]
+        {
+          sm_ComputeUVTrimCurveTasks(*pUVTrimCurvePrecompute);
         });
 
       pEditTracker.reset(new SmGeometryEditTracker);
       for (const SmPrebuiltFaceCache & crPrebuilt : sPrebuiltCaches)
         { if (crPrebuilt.pSC) pEditTracker->Watch(crPrebuilt.cpSurface); }
+      pUVTrimCurvePrecompute->Activate(pEditTracker.get());
     }
 
   // for every face - build its surface tessellation cache

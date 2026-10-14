@@ -404,5 +404,67 @@ public:
 
 } ; // end class SmEdgeuse
 
+class SmFace;
+class SmGeometryEditTracker;
+
+/*******************************************************************//**
+PURPOSE: Computes on worker threads the first SmSurface::DropCurve() call
+   that SmEdgeuse::CreateUVTrimCurve() will make for each face edgeuse
+   without a UVTrimCurve. While active, CreateUVTrimCurve() on the calling
+   thread uses such a drop, and repeats its surface cache side effects,
+   when the drop inputs are unchanged; otherwise it drops the curve itself.
+
+NOTES: 1. Prepare() and Activate() run on the thread that uses the results.
+          Between them CopySurface() runs once for every surface and then
+          ComputeTask() once for every task, each on any thread.
+       2. A task drops one edge curve, which no other task reads, onto
+          private copies of the face surfaces. A curve cache built by a
+          task is checked when it is first used and deleted at the end
+          when it was never used.
+       3. Callers must ensure that no notify callbacks are set.
+***********************************************************************/
+class SmUVTrimCurvePrecompute
+{
+public:
+  SmUVTrimCurvePrecompute();
+  ~SmUVTrimCurvePrecompute();
+
+  SmUVTrimCurvePrecompute(const SmUVTrimCurvePrecompute &) = delete;
+  SmUVTrimCurvePrecompute & operator=(const SmUVTrimCurvePrecompute &) = delete;
+
+  // picks the drops for the faces' edgeuses and records their inputs
+  void Prepare(const SmTArray<SmFace*> & crFaces);
+
+  // CopySurface() makes the master copy of one face surface, which tasks copy again
+  size_t GetSurfaceCount() const;
+  void   CopySurface(size_t lSurface);
+
+  // ComputeTask() computes the drops of one edge curve
+  size_t GetTaskCount() const;
+  void   ComputeTask(size_t lTask);
+
+  // uses the results on the calling thread while this object is in scope. pEditTracker,
+  // made after the tasks ran, then watches the drop inputs and must outlive this object.
+  void Activate(SmGeometryEditTracker * pEditTracker);
+
+  // called by SmEdgeuse::CreateUVTrimCurve() in place of its first DropCurve() call
+  static SmBoolean UseDrop(const SmEdgeuse            * cpEdgeuse,
+                           SmSurface                  * pSurface,
+                           const SmCurve              * cpCurve,
+                           const SmContext            * cpContext,
+                           const SmExtent2d           & crFaceDomain,
+                           const SmExtent1d           & crEdgeDomain,
+                           SmZoneTol3d                  sZoneTol3d,
+                           double                     & rdMaxDistToSurf,
+                           double                     & rdMaxApproxDev,
+                           SmTArray<SmBSplineCurve*>  & rUVCurves,
+                           SmDropCurveFail            * pDropCurveFail,
+                           SmStatus                   & reStatus);
+
+private:
+  void * m_pData;      // drops, tasks and results
+  void * m_pPrevious;  // precompute that was active before this one
+} ;
+
 #endif // !__SMEDGEUSE_H__
 
