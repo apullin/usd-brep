@@ -48,6 +48,7 @@
 #include <vector>
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_invoke.h>
+#include <SmParallel.h>
 
 /********************************************************************
    Precomputed refinement results for SubdivideToTolerancesParallel.
@@ -5125,7 +5126,7 @@ SmStatus SmSurfaceCache::SubdivideToTolerancesParallel
       Split(pSpec);
       if (!pSpec->bSplit)
         { return; }
-      tbb::parallel_invoke([&] { Explore(pSpec->pChild[0].get()); },
+      sm_ParallelInvoke([&] { Explore(pSpec->pChild[0].get()); },
                            [&] { Explore(pSpec->pChild[1].get()); });
     }
 
@@ -5148,7 +5149,7 @@ SmStatus SmSurfaceCache::SubdivideToTolerancesParallel
           const SmContext & crContext = *pCache->GetContext();
           pBlock->sCellHasPatch.assign(lCells, 0);
           pBlock->sCellBBox.resize(lCells);
-          tbb::parallel_for(size_t(0), lCells, [&](size_t lCell)
+          sm_ParallelFor(size_t(0), lCells, [&](size_t lCell)
             {
               const ULONG i = (ULONG)(lCell / lNumV) + 1;
               const ULONG j = (ULONG)(lCell % lNumV) + 1;
@@ -5192,7 +5193,7 @@ SmStatus SmSurfaceCache::SubdivideToTolerancesParallel
         sStack.push_back(pSpec->pChild[0].get());
       }
   }
-  tbb::parallel_for(size_t(0), sBlocks.size(), [&](size_t ii) { sWorker.Block(sBlocks[ii]); });
+  sm_ParallelFor(size_t(0), sBlocks.size(), [&](size_t ii) { sWorker.Block(sBlocks[ii]); });
 
   // serial recursion with lookups
   SmRefinePrecompute sPrecompute;

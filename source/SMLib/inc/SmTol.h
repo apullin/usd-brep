@@ -551,6 +551,18 @@ public:
   SM_NEWTOL_LINE static void        SetLargeSmallSizeRatio(SmBrep    & rBrep,    double dLargeSmallSizeRatio=SM_USE_DEFAULT) ; // set Brep::m_dLargeSmallSizeRatio
   static void                       SetLargeSmallSizeRatio(double dLargeSmallSizeRatio=SM_LARGE_SMALL_SIZE_RATIO) ; 
 
+  // The calling thread's tolerance defaults (set by SetModelSizeEstimate() and
+  // SetLargeSmallSizeRatio()), for running kernel work on other threads with them.
+  struct ThreadDefaults
+  {
+    double dZoneTol3d;
+    double dTolGapGain;
+    double dModelSizeEstimate;
+    double dLargeSmallSizeRatio;
+  };
+  static ThreadDefaults GetThreadDefaults() ;
+  static void           SetThreadDefaults(const ThreadDefaults & crDefaults) ;
+
   // helper functions - not usually needed
 
   // obsolete: No Need for this kind of rounding off - the SizeToModelSizeEstimate() and the SizeEstimateToZoneTol3d()

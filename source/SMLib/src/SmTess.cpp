@@ -33,6 +33,7 @@
 #include <iterator>
 
 #include "tbb/parallel_for.h"
+#include <SmParallel.h>
 #include <vector>
 
 // #define TIMER_CODE 1
@@ -7319,7 +7320,7 @@ SmStatus SmTess::OutputFacePolygons
       sParNormals.resize(lNumPolyVertices);
       sParPointStatus.assign(lNumPolyVertices, SM_ERR);
       sParNormalStatus.assign(lNumPolyVertices, SM_ERR);
-      tbb::parallel_for(tbb::blocked_range<ULONG>(0, lNumPolyVertices, 64), [&](const tbb::blocked_range<ULONG> & crRange)
+      sm_ParallelFor(tbb::blocked_range<ULONG>(0, lNumPolyVertices, 64), [&](const tbb::blocked_range<ULONG> & crRange)
         {
           for (ULONG ii = crRange.begin(); ii != crRange.end(); ++ii)
             {

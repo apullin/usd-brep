@@ -96,6 +96,19 @@
                                                                                                             ? SM_LARGE_SMALL_SIZE_RATIO
                                                                                                             : dLargeSmallSizeRatio ;  
                                                                                                        }
+  SmTol::ThreadDefaults SmTol::GetThreadDefaults()
+  {
+    return { s_ZoneTol3d.val, s_TolGapGain, s_ModelSizeEstimate, s_LargeSmallSizeRatio } ;
+  }
+
+  void SmTol::SetThreadDefaults(const ThreadDefaults & crDefaults)
+  {
+    s_ZoneTol3d.val       = crDefaults.dZoneTol3d ;
+    s_TolGapGain          = crDefaults.dTolGapGain ;
+    s_ModelSizeEstimate   = crDefaults.dModelSizeEstimate ;
+    s_LargeSmallSizeRatio = crDefaults.dLargeSmallSizeRatio ;
+  }
+
 #ifdef SM_USE_NEWTOL
  // // helper functions - not usually needed
  // SmZoneTol3d SizeEstimateToZoneTol3d(double dModelSizeEstimate)         { return (pow(floor(log10(fabs(dModelSizeEstimate)))/2.0,10)*1.0e-5) ; }
