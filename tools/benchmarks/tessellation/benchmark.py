@@ -8,8 +8,9 @@ Models are USD files with BrepArray prims, OCCT .brep files (converted with
 occt_to_usd), or directories of either. Each model is imported once, then
 tessellated with the default parameters in one warmup round and --repetitions
 measured rounds, in a seeded random order. Timings cover tessellate() only.
-Every round hashes the full-precision mesh arrays; --save records hashes and
-timings, and --compare reports speedups and fails if any mesh changed.
+Every round hashes the meshes, with points and face normals at double
+precision; --save records hashes and timings, and --compare reports speedups
+and fails if any mesh changed.
 """
 
 import argparse
@@ -101,7 +102,12 @@ def tessellate(sm, breps, parameters):
 
 
 def mesh_signature(meshes):
-    """SHA-256 of all mesh arrays at full precision, plus triangle counts or error messages."""
+    """SHA-256 of the meshes, plus triangle counts or error messages.
+
+    Points and face normals are hashed as the kernel's doubles. to_mesh_arrays()
+    rounds to float32, so only its vertex normals, which have no double-precision
+    accessor, and its face indices are taken from there.
+    """
     digest = hashlib.sha256()
     summary = []
     for mesh in meshes:
@@ -109,9 +115,10 @@ def mesh_signature(meshes):
             digest.update(b"tessellation failed")
             summary.append(str(mesh))
             continue
+        digest.update(array("d", itertools.chain.from_iterable(mesh.get_points())).tobytes())
+        digest.update(array("d", itertools.chain.from_iterable(face.get_normal() for face in mesh.get_faces())).tobytes())
         arrays = mesh.to_mesh_arrays()
-        for key in ("points", "normals", "face_normals"):
-            digest.update(array("d", itertools.chain.from_iterable(arrays[key])).tobytes())
+        digest.update(array("d", itertools.chain.from_iterable(arrays["normals"])).tobytes())
         digest.update(array("q", arrays["faces"]).tobytes())
         summary.append(len(arrays["face_normals"]))
     return digest.hexdigest(), summary
