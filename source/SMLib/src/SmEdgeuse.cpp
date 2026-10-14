@@ -41,8 +41,10 @@
 
 #include <cstring>
 #include <functional>
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
+#include <tbb/enumerable_thread_specific.h>
 
 //    // For debugging only - a set of pointers that can be assigned and inspected through the watch window
 //    #ifdef SM_DEBUG_CODE
@@ -6742,6 +6744,8 @@ struct SmPrecomputedDrop
   const gw_CURVE    * cpCurveNurb         = NULL;
   SmBoolean           bSurfaceOutOfBounds = FALSE;
   SmBoolean           bCurveOutOfBounds   = FALSE;
+  SmBoolean           bVertexDropsFail    = FALSE;  // drop only when the vertex below does not drop to one point
+  SmPoint3d           sVertexPoint;                 // edgeuse start vertex
 
   // results, set by ComputeTask()
   SmBoolean           bComputed           = FALSE;
@@ -6767,6 +6771,12 @@ struct SmPrecomputedCurveCache
   SmBoolean           bReplaced  = FALSE;  // dApproxTol had changed and the cache was rebuilt
 };
 
+// Copies of master surfaces that one thread uses to guess which drops to skip
+struct SmGuessSurfaces
+{
+  std::unordered_map<size_t, SmSurface*> sCopies;  // by surface index, owned
+};
+
 struct SmUVTrimCurvePrecomputeData
 {
   std::vector<SmPrecomputedDrop>                                 sDrops;
@@ -6777,6 +6787,7 @@ struct SmUVTrimCurvePrecomputeData
   std::vector<SmSurface*>                                        sSurfaces;     // face surfaces of the drops
   std::vector<const SmContext *>                                 sContexts;     //   their face contexts
   std::vector<SmSurface*>                                        sMasters;      //   their owned copies
+  tbb::enumerable_thread_specific<SmGuessSurfaces>               sGuessSurfaces;//   copies of the masters for each thread
   std::unordered_map<const SmCurve *, SmPrecomputedCurveCache *> sCurveCaches;  // set by Activate()
   const SmGeometryEditTracker                                  * cpEditTracker = NULL;
 };
@@ -6986,6 +6997,11 @@ SmUVTrimCurvePrecompute::~SmUVTrimCurvePrecompute()
     }
   for (SmSurface * pMaster : pData->sMasters)
     { delete pMaster; }
+  for (SmGuessSurfaces & rGuess : pData->sGuessSurfaces)
+    {
+      for (auto & rCopy : rGuess.sCopies)
+        { delete rCopy.second; }
+    }
   delete pData;
 
 } // end SmUVTrimCurvePrecompute::~SmUVTrimCurvePrecompute
@@ -7002,12 +7018,15 @@ NOTES: Only BSpline based geometry whose NURB data exists is used, so
    copies of it are made in.
 ***********************************************************************/
 void SmUVTrimCurvePrecompute::Prepare
- (const SmTArray<SmFace*> & crFaces)   // in : faces to be tessellated, NULL entries are skipped
+ (const SmTArray<SmFace*> & crFaces,           // in : faces to be tessellated, NULL entries are skipped
+  SmBoolean                 bVertexDropsFail)  // in : TRUE = a task drops a curve only when its edgeuse's start
+                                               //      vertex does not drop to one point of the surface
 {
   SmUVTrimCurvePrecomputeData * pData = (SmUVTrimCurvePrecomputeData *)m_pData;
   std::unordered_map<const SmSurface *, size_t> sSurfaceIndex;
   std::unordered_map<const SmCurve *, size_t>   sCurveTasks;
   std::vector<size_t>                           sDropTasks;   // task of each drop
+  std::vector<const SmVertex *>                 sSeamVertices;  // of one face
   SM_PTR_ARRAY(sLoopuses, SmLoopuse, 64) ;  // SmTArray<SmLoopuse *>
   SM_PTR_ARRAY(sEdgeuses, SmEdgeuse, 256) ; // SmTArray<SmEdgeuse *>
   sSurfaceIndex.reserve(crFaces.GetSize());
@@ -7027,14 +7046,36 @@ void SmUVTrimCurvePrecompute::Prepare
           || !sm_HasPlainSurfaceCache(pBSS))
         { continue; }
 
+      // a vertex drops to several surface points only on a seam: an edge whose radial
+      // edgeuse is on the same face
       pFace->GetUpwardLoopuses(sLoopuses);
+      sSeamVertices.clear();
+      if (bVertexDropsFail)
+        {
+          for (ULONG jj = 0; jj < sLoopuses.GetSize(); jj++)
+            {
+              sLoopuses[jj]->GetEdgeuses(sEdgeuses);
+              for (ULONG kk = 0; kk < sEdgeuses.GetSize(); kk++)
+                {
+                  SmEdgeuse * pRadial = sEdgeuses[kk]->GetRadial();
+                  if (pRadial != NULL && pRadial->GetFace() == pFace)
+                    { sSeamVertices.push_back(sEdgeuses[kk]->GetVertexuse()->GetVertex()); }
+                }
+            }
+          if (sSeamVertices.empty())
+            { continue; }
+        }
+
       for (ULONG jj = 0; jj < sLoopuses.GetSize(); jj++)
         {
           sLoopuses[jj]->GetEdgeuses(sEdgeuses);
           for (ULONG kk = 0; kk < sEdgeuses.GetSize(); kk++)
             {
               SmEdgeuse * pEU = sEdgeuses[kk];
-              if (pEU->GetUVTrimCurve() != NULL)
+              if (   pEU->GetUVTrimCurve() != NULL
+                  || (   bVertexDropsFail
+                      && std::find(sSeamVertices.begin(), sSeamVertices.end(), pEU->GetVertexuse()->GetVertex())
+                         == sSeamVertices.end()))
                 { continue; }
               SmEdge         * pEdge = pEU->GetEdge();
               SmBSplineCurve * pBSC  = pEdge ? SM_CAST_PTR(SmBSplineCurve, pEdge->GetCurve()) : NULL;
@@ -7066,6 +7107,9 @@ void SmUVTrimCurvePrecompute::Prepare
               sDrop.cpCurveNurb         = pBSC->GetGwNurbPointer();
               sDrop.bSurfaceOutOfBounds = pBSS->GetOutOfBoundsEnabled();
               sDrop.bCurveOutOfBounds   = pBSC->GetOutOfBoundsEnabled();
+              sDrop.bVertexDropsFail    = bVertexDropsFail;
+              if (bVertexDropsFail)
+                { sDrop.sVertexPoint = pEU->GetVertexuse()->GetVertex()->GetPoint(); }
 
               pData->sDrops.push_back(sDrop);
               sDropTasks.push_back(sCurveTasks.emplace(pBSC, sCurveTasks.size()).first->second);
@@ -7151,6 +7195,24 @@ void sm_ComputeDrop
   SmSurface       * pSurface = NULL;
   if (cpMaster == NULL)
     { return; }
+
+  // skip the drop when the vertex drops to one surface point: only a guess of what
+  // the serial code does, so this thread's surface copy can't change any result
+  if (rDrop.bVertexDropsFail)
+    {
+      SmSurface *& rpGuess = rData.sGuessSurfaces.local().sCopies[rDrop.lSurface];
+      if (rpGuess == NULL && (cpMaster->Copy(*rDrop.cpContext, rpGuess) != SM_SUCCESS || rpGuess == NULL))
+        { return; }
+      SmBoolean       bSuccess = FALSE, bIsMulti = FALSE;
+      SmPoint2d       sUV;
+      double          dGap = 0.0;
+      SmSolution      sData[4];
+      SmSolutionArray sSolutions(4, sData);
+      rpGuess->DropPoint(rDrop.sVertexPoint, rDrop.sFaceDomain, NULL, bSuccess, sUV, dGap, bIsMulti,
+                         SM_SO_MINIMIZE, NULL, &sSolutions);
+      if (bSuccess && !bIsMulti)
+        { return; }
+    }
 
   if (cpMaster->Copy(*rDrop.cpContext, pSurface) != SM_SUCCESS || pSurface == NULL)
     { return; }

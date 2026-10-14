@@ -432,8 +432,11 @@ public:
   SmUVTrimCurvePrecompute(const SmUVTrimCurvePrecompute &) = delete;
   SmUVTrimCurvePrecompute & operator=(const SmUVTrimCurvePrecompute &) = delete;
 
-  // picks the drops for the faces' edgeuses and records their inputs
-  void Prepare(const SmTArray<SmFace*> & crFaces);
+  // picks the drops for the faces' edgeuses and records their inputs. With bVertexDropsFail, only
+  // edgeuses starting on a seam are picked, and a task only drops a curve when dropping the start
+  // vertex to the surface fails or is multivalued: SmTess::SplitFaceEdgesToUVSize() makes
+  // UVTrimCurves only then.
+  void Prepare(const SmTArray<SmFace*> & crFaces, SmBoolean bVertexDropsFail = FALSE);
 
   // CopySurface() makes the master copy of one face surface, which tasks copy again
   size_t GetSurfaceCount() const;

@@ -12571,6 +12571,24 @@ SmStatus SmTess::Phase1SetupBrep
 #endif
 #endif
 
+  #ifndef SM_USE_TBB
+  // UVTrimCurves are still missing for edgeuses whose edges were split above. Below some
+  // of them are made; drop their edge curves on worker threads first as well.
+  if (bPrecompute)
+    {
+      pUVTrimCurvePrecompute.reset();
+      pEditTracker.reset();
+      pUVTrimCurvePrecompute.reset(new SmUVTrimCurvePrecompute);
+      pUVTrimCurvePrecompute->Prepare(sFaces, TRUE);
+      if (pUVTrimCurvePrecompute->GetTaskCount() > 0)
+        {
+          sm_ComputeUVTrimCurveTasks(*pUVTrimCurvePrecompute);
+          pEditTracker.reset(new SmGeometryEditTracker);
+          pUVTrimCurvePrecompute->Activate(pEditTracker.get());
+        }
+    }
+  #endif
+
   // Next, call SplitFaceEdgesToUVSize() on each face.
   // This splits all Face->Edges to be as small as
   // the SmTrimSrfCache leaf nodes that contain them.
