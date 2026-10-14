@@ -1198,6 +1198,12 @@ public:
 
   virtual SmVector3d    GetNormal3d  (SmSurface *pOptSurface=NULL) const ;   // when pOptSurface != NULL && pOrigSurf != NULL, rtn 3d space normal
 
+  // GetNormal() of a triangle whose GetPolyEdges() are cpPolyEdge1, cpPolyEdge2 and one more,
+  // returning FALSE with no side effects when GetNormal() would warn, update tolerances or keep a default normal
+  SmBoolean             GetTriangleNormal(const SmPolyEdge * cpPolyEdge1,
+                                          const SmPolyEdge * cpPolyEdge2,
+                                          SmVector3d       & rNormal) const;
+
   double                GetMaxDihedralAngRad(SmPolyEdge ** pOptPolyEdge  =NULL,   // rtn: [0-2Pi] ang for max edge->Dihedral angle - lamina edges = 2Pi
                                              SmVector3d  * pOptDiAngColor=NULL) const ;    
 

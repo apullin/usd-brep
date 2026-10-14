@@ -13979,6 +13979,38 @@ SmStatus SmPolyFace::ComputeSphereBound
 } // end SmPolyFace::ComputeSphereBound
 
 /*******************************************************************//**
+PURPOSE: GetNormal() helper: the normal of a triangle, or of a PolyLoop of
+  2 PolyEdges under construction, from its first two PolyEdges.
+
+NOTES: Returns TRUE with the unit normal, or FALSE with [1 1 1] when the
+  PolyEdges are too close to parallel. Touches nothing but rNormal.
+***********************************************************************/
+static SmBoolean sm_GetTriangleNormal
+ (const SmPolyEdge * cpPolyEdge1,  // in : first PolyEdge
+  const SmPolyEdge * cpPolyEdge2,  // in : second PolyEdge
+  SmVector3d       & rNormal)      // out: unit normal, or [1 1 1]
+{
+  SmPoint3d  sPnt  = cpPolyEdge1->GetStartPoint();
+  SmVector3d sVec1 = cpPolyEdge1->GetEndPoint() - sPnt;
+  SmVector3d sVec2 = cpPolyEdge2->GetEndPoint() - sPnt;
+
+  // let normal = crossProduct of two PolyFace->PolyEdge directions
+  rNormal = sVec1*sVec2;
+
+  // output a normalized vector when possible
+  if(rNormal.LengthSquared() > SM_EFF_ZERO_SQ)
+    {
+      rNormal.Unitize(); // succeeds: its zero length test is the one above
+      return TRUE;
+    }
+
+  // set rNormal back to init value [1 1 1]
+  rNormal.Set(1,1,1);
+  return FALSE;
+
+} // end sm_GetTriangleNormal
+
+/*******************************************************************//**
 PURPOSE: Calculate and return normal of a SmPolyFace possibly resetting m_vNormal value.
          In the Raw Data Space 
          (if SmPolyFace is in 2d, it will be the 2d normal, i.e the z direction)
@@ -14039,23 +14071,7 @@ SmVector3d SmPolyFace::GetNormal   // rtn: effective normal for this PolyFace
   if(   lTotalEdges == 3
      || lTotalEdges == 2) 
     {
-      SmPolyEdge * pPolyEdge = sPolyEdges[0];
-      SmPoint3d    sPnt      = pPolyEdge->GetStartPoint();
-      SmVector3d   sVec1     = pPolyEdge->GetEndPoint() - sPnt;
-      SmVector3d   sVec2     = sPolyEdges[1]->GetEndPoint() - sPnt;
-
-      // let normal = crossProduct of two PolyFace->PolyEdge directions
-      sNormal = sVec1*sVec2;
-
-      // output a normalized vector when possible 
-      if(sNormal.LengthSquared() > SM_EFF_ZERO_SQ) 
-        {
-          SE(sNormal.Unitize());
-        }
-      else // set sNormal back to init value [1 1 1]
-        {
-          sNormal.Set(1,1,1);
-        }
+      sm_GetTriangleNormal(sPolyEdges[0], sPolyEdges[1], sNormal);
     } // end Polygon lTotalEdges == 3 check
 
   // all N-sided polygons bigger than triangles - set sNormal and dMaxDeviation
@@ -14245,6 +14261,46 @@ SmBoolean bDebugMe = FALSE;
   return sNormal;
 
 } // end SmPolyFace::GetNormal
+
+/*******************************************************************//**
+PURPOSE: GetNormal() of a triangle PolyFace, for callers that must not
+  signal warnings or change tolerances, e.g. on worker threads.
+
+NOTES: cpPolyEdge1 and cpPolyEdge2 must be the first two of the 3 PolyEdges
+  that GetPolyEdges() returns. Returns FALSE and changes nothing when
+  GetNormal() would warn, update tolerances or keep a default normal.
+  Otherwise sets rNormal, m_vNormal and m_dMaxDeviation as GetNormal().
+  Touches no other PolyFace, so different PolyFaces may run in parallel.
+***********************************************************************/
+SmBoolean SmPolyFace::GetTriangleNormal
+ (const SmPolyEdge * cpPolyEdge1,  // in : first PolyEdge of this triangle
+  const SmPolyEdge * cpPolyEdge2,  // in : second PolyEdge of this triangle
+  SmVector3d       & rNormal)      // out: GetNormal() value when TRUE is returned
+ const
+{
+  // no work - normal already computed
+  if(m_dMaxDeviation > -SM_BIG_DOUBLE)
+    {
+      rNormal = m_vNormal;
+      return TRUE;
+    }
+
+  // GetNormal() warns or keeps a default normal without a unit normal, and it
+  // updates tolerances when they are below a triangle's dMaxDeviation of 0.0
+  SmVector3d sNormal;
+  if(   !sm_GetTriangleNormal(cpPolyEdge1, cpPolyEdge2, sNormal)
+     || sNormal.LengthSquared() > 1.1
+     || 0.0 > GetTolerance())
+    { return FALSE; }
+
+  // set side effects as GetNormal()
+  SmPolyFace * pPolyFace     = SM_CONST_CAST(SmPolyFace*,this);
+  pPolyFace->m_dMaxDeviation = 0.0;
+  pPolyFace->m_vNormal       = sNormal;
+  rNormal                    = sNormal;
+  return TRUE;
+
+} // end SmPolyFace::GetTriangleNormal
 
 /*******************************************************************//**
 PURPOSE: When pOrigSurface != NULL return normal in 3d space (not raw space)

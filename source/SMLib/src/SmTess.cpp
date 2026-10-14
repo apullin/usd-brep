@@ -7086,6 +7086,40 @@ static SmStatus sm_GetFan
 
 } // end sm_GetFan
 
+namespace {
+
+/*******************************************************************//**
+PURPOSE: OutputToPolyBrep() helper data: a FacePolyBrep triangle that was
+  gathered on a worker thread, so the serial output loop does not need to
+  walk its PolyLoop.
+
+NOTES: The PolyEdge data is in PolyLoop order, before any bReverse.
+***********************************************************************/
+struct SmOutputTriangle
+{
+  SmVector3d  sNormal;          // pFPB_PolyFace->GetNormal3d()
+  SmFace    * pOriginalFace;    // pFPB_PolyFace->GetOriginalFace()
+  SmEdgeuse * pEdgeuses[3];     // PolyEdge->GetOriginalEdgeuse()
+  ULONG       lStarts[3];       // PolyEdge->GetStartPolyVertex()->GetIndexValue()
+  ULONG       lEnds[3];         // PolyEdge->GetEndPolyVertex()->GetIndexValue()
+  SmBoolean   bSameEnds[3];     // PolyEdge Start PolyVertex == End PolyVertex
+  SmBoolean   bGathered;        // FALSE = the output loop walks the PolyFace
+} ;
+
+/*******************************************************************//**
+PURPOSE: OutputToPolyBrep() helper data: one PolyEdge of a FacePolyBrep
+  PolyLoop in output order, i.e. after any bReverse.
+***********************************************************************/
+struct SmOutputEdge
+{
+  ULONG       lStart;           // Start PolyVertex IndexValue
+  ULONG       lEnd;             // End PolyVertex IndexValue
+  SmEdgeuse * pEdgeuse;         // PolyEdge->GetOriginalEdgeuse()
+  SmBoolean   bSameEnds;        // Start PolyVertex == End PolyVertex
+} ;
+
+} // end anonymous namespace
+
 /*******************************************************************//**
 PURPOSE: Tessellate Output - copy one PFace->Surface's
   (SmTessSrfCache)pSC->mTS_pPolyBrep->pPolyTopology objs to m_p3DPolyBrep.
@@ -7233,32 +7267,99 @@ SmStatus SmTess::OutputToPolyBrep
     }
 #endif // SM_DEBUG_CODE
 
+  // Gather the triangles of large FacePolyBreps on worker threads. A gathered triangle gets its
+  // GetNormal3d() result here, with the same PolyFace side effects; others take the general path below.
+  static constexpr ULONG slMinParallelFaces = 1024;
+  std::vector<SmOutputTriangle> sTriangles;
+  if (lNumFaces >= slMinParallelFaces)
+    {
+      sTriangles.resize(lNumFaces);
+      sm_ParallelFor(tbb::blocked_range<ULONG>(0, lNumFaces, 64), [&](const tbb::blocked_range<ULONG> & crRange)
+        {
+          for (ULONG ff = crRange.begin(); ff != crRange.end(); ++ff)
+            {
+              SmPolyFace       * pPolyFace = sFPB_PolyFaces[ff];
+              SmOutputTriangle & rTri      = sTriangles[ff];
+              SmPolyLoop       * pLoop     = pPolyFace->GetOuterPolyLoop();
+              rTri.bGathered = FALSE;
+
+              // only plain PolyFaces (SmCPolyFace overrides GetNormal3d) with a single PolyLoop of 3 PolyEdges in a closed list
+              if (   pLoop == NULL
+                  || pPolyFace->GetType() != SmPolyFace_TYPE
+                  || pPolyFace->GetSize() != 1
+                  || pLoop->m_pNext != pLoop
+                  || pLoop->GetSize() != 3)
+                { continue; }
+              SmPolyEdge * pEdges[3];
+              pEdges[0] = (SmPolyEdge *)pLoop->GetList();
+              pEdges[1] = pEdges[0] ? (SmPolyEdge *)pEdges[0]->m_pNext : NULL;
+              pEdges[2] = pEdges[1] ? (SmPolyEdge *)pEdges[1]->m_pNext : NULL;
+              if (pEdges[2] == NULL || pEdges[2]->m_pNext != pEdges[0])
+                { continue; }
+
+              SmPolyVertex * pEnds[3];
+              for (ULONG lEdge=0; lEdge<3; lEdge++)
+                { pEnds[lEdge] = pEdges[lEdge]->GetEndPolyVertex(); }
+              if (   !pEdges[0]->GetStartPolyVertex() || !pEdges[1]->GetStartPolyVertex() || !pEdges[2]->GetStartPolyVertex()
+                  || !pEnds[0] || !pEnds[1] || !pEnds[2])
+                { continue; }
+
+              // GetNormal3d() returns GetNormal() when the PolyFace is not 2d
+              if (   pEdges[0]->Is2d()
+                  || !pPolyFace->GetTriangleNormal(pEdges[0], pEdges[1], rTri.sNormal))
+                { continue; }
+
+              rTri.pOriginalFace = pPolyFace->GetOriginalFace();
+              for (ULONG lEdge=0; lEdge<3; lEdge++)
+                {
+                  SmPolyVertex * pStart = pEdges[lEdge]->GetStartPolyVertex();
+                  rTri.lStarts[lEdge]   = pStart->GetIndexValue();
+                  rTri.lEnds[lEdge]     = pEnds[lEdge]->GetIndexValue();
+                  rTri.bSameEnds[lEdge] = (pStart == pEnds[lEdge]);
+                  rTri.pEdgeuses[lEdge] = pEdges[lEdge]->GetOriginalEdgeuse();
+                }
+              rTri.bGathered = TRUE;
+            }
+        });
+    }
+
+  // per PolyFace data: the FPB OuterLoop start PolyVertex IndexValues and the PolyEdges of all PolyLoops in output order
+  std::vector<ULONG>        sOuterStarts;
+  std::vector<SmOutputEdge> sLoopEdges;
+  std::vector<ULONG>        sLoopEnds;     // end of each PolyLoop in sLoopEdges
+
   // for every FacePolyBrep->PolyFace - create a new SmPolyFace in m_p3DPolyBrep
   for (ii=0; ii<lNumFaces; ii++)
     {
-      SmPolyFace *pFPB_PolyFace  = sFPB_PolyFaces[ii];
-      SmVector3d  sNorm          = pFPB_PolyFace->GetNormal3d() ;
-      double      dNormSize      = sNorm.Length() ;
-      SmPolyLoop *pFPB_OuterLoop = pFPB_PolyFace->GetOuterPolyLoop() ;
-      if ( pFPB_OuterLoop == NULL )  // [B436]
+      SmPolyFace       *pFPB_PolyFace  = sFPB_PolyFaces[ii];
+      SmOutputTriangle *pTri           = (!sTriangles.empty() && sTriangles[ii].bGathered) ? &sTriangles[ii] : NULL ;
+      SmVector3d        sNorm          = pTri ? pTri->sNormal : pFPB_PolyFace->GetNormal3d() ;
+      double            dNormSize      = sNorm.Length() ;
+      SmPolyLoop       *pFPB_OuterLoop = pTri ? NULL : pFPB_PolyFace->GetOuterPolyLoop() ;
+      if ( pTri == NULL && pFPB_OuterLoop == NULL )  // [B436]
         {
           WARN(_T(" SmTess::OutputToPolyBrep: Null OuterPolyLoop found in a PolyFace" ) );
           continue;
         }
 
-      pFPB_OuterLoop->GetPolyEdges(sFPB_PolyLoopEdges);
-      ULONG       lNumEdges      = sFPB_PolyLoopEdges.GetSize();
+      sOuterStarts.clear();
+      if (pTri)
+        { sOuterStarts.assign(pTri->lStarts, pTri->lStarts + 3); }
+      else
+        {
+          pFPB_OuterLoop->GetPolyEdges(sFPB_PolyLoopEdges);
+          SM_ASSERT(pFPB_OuterLoop->IsClosed()) ;
+          for(jj=0;jj<sFPB_PolyLoopEdges.GetSize();jj++)
+            { sOuterStarts.push_back(sFPB_PolyLoopEdges[jj]->GetStartPolyVertex()->GetIndexValue()); }
+        }
+      ULONG       lNumEdges      = (ULONG)sOuterStarts.size();
       ULONG       lEdge3DCnt     = 0 ;
 
       // count FPB OuterLoop distinct PolyEdge3D objects
-      SM_ASSERT(pFPB_OuterLoop->IsClosed()) ;
       for(jj=0;jj<lNumEdges;jj++)
         {
-          SmPolyEdge   * pFPB_PolyEdge = sFPB_PolyLoopEdges[jj] ;
-          SmPolyEdge   * pFPB_NextEdge = sFPB_PolyLoopEdges[(jj+1)%lNumEdges] ;
-
-          ULONG          lIndx         = pFPB_PolyEdge->GetStartPolyVertex()->GetIndexValue() ;
-          ULONG          lNext         = pFPB_NextEdge->GetStartPolyVertex()->GetIndexValue() ;
+          ULONG          lIndx         = sOuterStarts[jj] ;
+          ULONG          lNext         = sOuterStarts[(jj+1)%lNumEdges] ;
 
           SmPolyVertex * pPolyVertex3D = sNewVertices[lIndx] ;
           SmPolyVertex * pNextVertex3D = sNewVertices[lNext] ;
@@ -7293,12 +7394,54 @@ SmStatus SmTess::OutputToPolyBrep
         { *ppOptPolyShell = pNewPFace->GetPolyShell() ; }
 
       // propagate PolyFace data as needed
-      pNewPFace->SetOriginalFace(pFPB_PolyFace->GetOriginalFace(), TRUE) ; // TRUE = copy pOriginalFace->Attributes onto pNewPFace
+      pNewPFace->SetOriginalFace(pTri ? pTri->pOriginalFace : pFPB_PolyFace->GetOriginalFace(), TRUE) ; // TRUE = copy pOriginalFace->Attributes onto pNewPFace
 
-      // get FacePolyBrep->PolyFace->PolyLoops
-      pFPB_PolyFace->GetPolyLoops(sFPB_PolyFaceLoops);
+      // get FacePolyBrep->PolyFace->PolyLoops->PolyEdges, reversed when asked
+      sLoopEdges.clear();
+      sLoopEnds.clear();
+      if (pTri)
+        {
+          for (kk=0; kk<3; kk++)
+            {
+              ULONG lEdge = bReverse ? 2-kk : kk;
+              sLoopEdges.push_back({bReverse ? pTri->lEnds[lEdge] : pTri->lStarts[lEdge],
+                                    bReverse ? pTri->lStarts[lEdge] : pTri->lEnds[lEdge],
+                                    pTri->pEdgeuses[lEdge],
+                                    pTri->bSameEnds[lEdge]});
+            }
+          sLoopEnds.push_back(3);
+        }
+      else
+        {
+          pFPB_PolyFace->GetPolyLoops(sFPB_PolyFaceLoops);
+          for (jj=0; jj<sFPB_PolyFaceLoops.GetSize(); jj++)
+            {
+              sFPB_PolyFaceLoops[jj]->GetPolyEdges(sFPB_PolyLoopEdges);
+              if (bReverse)
+                {
+                  sFPB_PolyLoopEdges.ReverseArray(0,sFPB_PolyLoopEdges.GetSize());
+                }
+              for (kk=0; kk<sFPB_PolyLoopEdges.GetSize(); kk++)
+                {
+                  SmPolyEdge   * pFPB_PolyEdge    = sFPB_PolyLoopEdges[kk];
+                  SmPolyVertex * pFPB_StartVertex = pFPB_PolyEdge->GetStartPolyVertex();
+                  SmPolyVertex * pFPB_EndVertex   = pFPB_PolyEdge->GetEndPolyVertex();
+                  if (bReverse)
+                    {
+                      SmPolyVertex *pTmp = pFPB_StartVertex;
+                      pFPB_StartVertex   = pFPB_EndVertex;
+                      pFPB_EndVertex     = pTmp;
+                    }
+                  sLoopEdges.push_back({pFPB_StartVertex->GetIndexValue(),
+                                        pFPB_EndVertex->GetIndexValue(),
+                                        pFPB_PolyEdge->GetOriginalEdgeuse(),
+                                        pFPB_StartVertex == pFPB_EndVertex});
+                }
+              sLoopEnds.push_back((ULONG)sLoopEdges.size());
+            }
+        }
       ULONG lEdgesCreated = 0;
-      ULONG lNumLoops = sFPB_PolyFaceLoops.GetSize();
+      ULONG lNumLoops = (ULONG)sLoopEnds.size();
 
       // for every FacePolyBrep->PolyFace->PolyLoop - build a Loop in pNewPFace
       for (jj=0; jj<lNumLoops; jj++)
@@ -7308,52 +7451,35 @@ SmStatus SmTess::OutputToPolyBrep
 
           pNewPLoop->m_eOrientation = (jj > 0) ? SM_OT_OPPOSITE : SM_OT_SAME ;
 
-          // FPB_PolyLoop->Edges
-          sFPB_PolyFaceLoops[jj]->GetPolyEdges(sFPB_PolyLoopEdges);
-
-          // when asked - reverse the FPB_PolyLoop edge order
-          if (bReverse)
-            {
-              sFPB_PolyLoopEdges.ReverseArray(0,sFPB_PolyLoopEdges.GetSize());
-            }
-
           // for every nonDegenerate FPB_PolyLoop->Edge - Build a PolyLoop3D->Edge
-          lNumEdges = sFPB_PolyLoopEdges.GetSize();
-          for (kk=0; kk<lNumEdges; kk++)
+          for (kk=(jj > 0) ? sLoopEnds[jj-1] : 0; kk<sLoopEnds[jj]; kk++)
             {
-              SmPolyEdge   * pFPB_PolyEdge    = sFPB_PolyLoopEdges[kk];
-              SmPolyVertex * pFPB_StartVertex = pFPB_PolyEdge->GetStartPolyVertex();
-              SmPolyVertex * pFPB_EndVertex   = pFPB_PolyEdge->GetEndPolyVertex();
-
-              if (bReverse)
-                {
-                  SmPolyVertex *pTmp = pFPB_StartVertex;
-                  pFPB_StartVertex   = pFPB_EndVertex;
-                  pFPB_EndVertex     = pTmp;
-                }
+              const SmOutputEdge & crFPB_PolyEdge = sLoopEdges[kk];
+              ULONG                lStart         = crFPB_PolyEdge.lStart;
+              ULONG                lEnd           = crFPB_PolyEdge.lEnd;
 
               // check for zero length 2D edges in existing pFPB_PolyBrep MappedSmTessSrfCache
-              if (pFPB_StartVertex == pFPB_EndVertex)
+              if (crFPB_PolyEdge.bSameEnds)
                 {
                   SE(SM_ERR);
                 }
 
               // FPB_PolyEdge->PolyVertices3D
               SmPolyEdge   * pNewPEdge;
-              SmPolyVertex * pNewStart = sNewVertices[pFPB_StartVertex->GetIndexValue()];
-              SmPolyVertex * pNewEnd   = sNewVertices[pFPB_EndVertex->GetIndexValue()];
+              SmPolyVertex * pNewStart = sNewVertices[lStart];
+              SmPolyVertex * pNewEnd   = sNewVertices[lEnd];
 
               // Add surface normals to NewStart and NewEnd. Only need 1 per Original Face
               if (!pNewStart->IsMarked(eMarkType))
               {
                   pNewStart->AddFaceToList(pNewPFace);
-                  pNewStart->AddFaceNormal(cr3DNormals[pFPB_StartVertex->GetIndexValue()]);
+                  pNewStart->AddFaceNormal(cr3DNormals[lStart]);
                   pNewStart->Mark(eMarkType);
               }
               if (!pNewEnd->IsMarked(eMarkType))
               {
                   pNewEnd->AddFaceToList(pNewPFace);
-                  pNewEnd->AddFaceNormal(cr3DNormals[pFPB_EndVertex->GetIndexValue()]);
+                  pNewEnd->AddFaceNormal(cr3DNormals[lEnd]);
                   pNewEnd->Mark(eMarkType);
               }
 
@@ -7375,8 +7501,8 @@ SmStatus SmTess::OutputToPolyBrep
               if (sP1.DistanceBetween(sP2) < dTolerance/100.0)
                 {
 #ifdef SM_DEBUG_CODE
-                  SmPoint2d sUV1 = crUVPoints[pFPB_StartVertex->GetIndexValue()];
-                  SmPoint2d sUV2 = crUVPoints[pFPB_EndVertex->GetIndexValue()];
+                  SmPoint2d sUV1 = crUVPoints[lStart];
+                  SmPoint2d sUV2 = crUVPoints[lEnd];
                   SM_ASSERT_MSG(!sUV1.CloserThan(SM_EFF_ZERO, sUV2), _T("OutputToPolyBrep found Coincident UVPoints PolyVertices")) ;
                   //SmSurface *pSurf = pFace ? pFace->GetSurface() : NULL ;
                   //SmSurfParamType eSingularDir1, eSingularDir2 ;
@@ -7429,10 +7555,10 @@ SmStatus SmTess::OutputToPolyBrep
               } // end each deleted polyvertex
 
               // Set pNewEdge->pAuxData - this increments the pAuxData use count
-              pNewPEdge->SetAuxData(sNewAuxData[pFPB_StartVertex->GetIndexValue()]);
+              pNewPEdge->SetAuxData(sNewAuxData[lStart]);
 
               // propagate PolyFace data as needed
-              pNewPEdge->SetOriginalEdgeuse(pFPB_PolyEdge->GetOriginalEdgeuse(), TRUE) ; // TRUE = copy pOriginalFace->Attributes onto pNewPFace
+              pNewPEdge->SetOriginalEdgeuse(crFPB_PolyEdge.pEdgeuse, TRUE) ; // TRUE = copy pOriginalFace->Attributes onto pNewPFace
 
 #ifdef SM_DEBUG_CODE
               SM_ASSERT_BREAK(pNewPEdge->GetStartPolyVertex() != NULL);
@@ -7868,9 +7994,6 @@ SmStatus SmTess::OutputFacePolygons
   SM_OBJ_ARRAY(sPoints,       SmPoint3d,  32) ; // SmTArray<SmPoint3d>  - for indiviudal polygons
   SM_OBJ_ARRAY(sNormals,      SmVector3d, 32) ; // SmTArray<SmVector3d> - for indiviudal polygons
 
-  // get all PolyBrep PolyFaces
-  pFPB_PolyBrep->GetPolyFaces(sFPB_PolyFaces);
-
   // get all PolyBrep PolyVertices
   pFPB_PolyBrep->GetPolyVertices(sFPB_PolyVertices);  // some might be topological vertices on singular Edges
   ULONG lNumPolyVertices = sFPB_PolyVertices.GetSize() ;
@@ -7906,13 +8029,54 @@ SmStatus SmTess::OutputFacePolygons
   // 1. Gather PolyVertData(PointUV, Point3D, Normal3D, BrepVertex)
   //     order the array[WithEdgeuse, Without] - watch out for PolyVerts on Surface degeneracies
 
+  // For large faces, find the PolyVertex edgeuses on worker threads, and for BSpline faces also
+  // evaluate their points and normals; the loops below use them in place of their own calls.
+  static constexpr ULONG slMinParallelVertices = 2048;
+  std::vector<SmEdgeuse *>   sParEdgeuses;
+  std::vector<SmPoint3d>     sParPoints;
+  std::vector<SmVector3d>    sParNormals;
+  std::vector<SmStatus>      sParPointStatus, sParNormalStatus;
+  const SmBoolean bParallel     = lNumPolyVertices >= slMinParallelVertices;
+  const SmBoolean bParallelEval = bParallel && pSurf->GetType() == SmBSplineSurface_TYPE;
+  if (bParallel)
+    {
+      const SmBoolean bNormals = rPolygonOutput.GetGenerateNormals();
+      sParEdgeuses.resize(lNumPolyVertices);
+      if (bParallelEval)
+        {
+          ((SmBSplineSurface *)pSurf)->GetOrCreateGwNurbPointer();  // built before sharing the surface
+          sParPoints.resize(lNumPolyVertices);
+          sParNormals.resize(lNumPolyVertices);
+          sParPointStatus.assign(lNumPolyVertices, SM_ERR);
+          sParNormalStatus.assign(lNumPolyVertices, SM_ERR);
+        }
+      sm_ParallelFor(tbb::blocked_range<ULONG>(0, lNumPolyVertices, 64), [&](const tbb::blocked_range<ULONG> & crRange)
+        {
+          for (ULONG ii = crRange.begin(); ii != crRange.end(); ++ii)
+            {
+              SmPolyVertex * pPolyVertex = sFPB_PolyVertices[ii] ;
+              sParEdgeuses[ii] = pPolyVertex->GetOriginalEdgeuse();
+              if (!bParallelEval)
+                { continue; }
+              const SmPoint3d & crUV = pPolyVertex->GetPoint();
+              SmPoint2d sUVPoint( crUV.x, crUV.y );
+              // as below: vertices without an edgeuse are evaluated on the surface
+              if (!sParEdgeuses[ii])
+                { sParPointStatus[ii] = pSurf->EvaluatePoint(sUVPoint, sParPoints[ii]); }
+              if (bNormals)
+                { sParNormalStatus[ii] = pSurf->EvaluateNormal(sUVPoint, TRUE, TRUE, sParNormals[ii]); }
+            }
+        });
+    }
+
   // for every FBP_PolyVertex - init IndexValue assignments for PolyVertices with edgeuse
   for(ULONG ii=0;ii<lNumPolyVertices;ii++)
     {
       SmPolyVertex *pPolyVertex = sFPB_PolyVertices[ii] ;
+      SmEdgeuse    *pPVEdgeuse  = bParallel ? sParEdgeuses[ii] : pPolyVertex->GetOriginalEdgeuse() ;
 
       // first half of IndexValue assignments for WithEdgeuse PolyVertices
-      if(pPolyVertex->GetOriginalEdgeuse()) { pPolyVertex->SetIndexValue(lIndexCnt) ;
+      if(pPVEdgeuse)                        { pPolyVertex->SetIndexValue(lIndexCnt) ;
                                               lIndexCnt++ ;
                                             }
       else                                  { pPolyVertex->UnInitIndexValue() ; }
@@ -7925,38 +8089,6 @@ SmStatus SmTess::OutputFacePolygons
   SmVector3d  sNorm(0,0,0);
   SmEdgeuse * pEdgeuse ;
 
-  // Evaluate the points and normals of large BSpline faces on worker threads;
-  // the loop below uses them in place of its own evaluations.
-  static constexpr ULONG slMinParallelVertices = 2048;
-  std::vector<SmPoint3d>     sParPoints;
-  std::vector<SmVector3d>    sParNormals;
-  std::vector<SmStatus>      sParPointStatus, sParNormalStatus;
-  const SmBoolean bParallelEval =    lNumPolyVertices >= slMinParallelVertices
-                                  && pSurf->GetType() == SmBSplineSurface_TYPE;
-  if (bParallelEval)
-    {
-      const SmBoolean bNormals = rPolygonOutput.GetGenerateNormals();
-      ((SmBSplineSurface *)pSurf)->GetOrCreateGwNurbPointer();  // built before sharing the surface
-      sParPoints.resize(lNumPolyVertices);
-      sParNormals.resize(lNumPolyVertices);
-      sParPointStatus.assign(lNumPolyVertices, SM_ERR);
-      sParNormalStatus.assign(lNumPolyVertices, SM_ERR);
-      sm_ParallelFor(tbb::blocked_range<ULONG>(0, lNumPolyVertices, 64), [&](const tbb::blocked_range<ULONG> & crRange)
-        {
-          for (ULONG ii = crRange.begin(); ii != crRange.end(); ++ii)
-            {
-              SmPolyVertex * pPolyVertex = sFPB_PolyVertices[ii] ;
-              const SmPoint3d & crUV = pPolyVertex->GetPoint();
-              SmPoint2d sUVPoint( crUV.x, crUV.y );
-              // as below: vertices without an edgeuse are evaluated on the surface
-              if (!pPolyVertex->IsIndexValueInit() || !pPolyVertex->GetEdgeuse())
-                { sParPointStatus[ii] = pSurf->EvaluatePoint(sUVPoint, sParPoints[ii]); }
-              if (bNormals)
-                { sParNormalStatus[ii] = pSurf->EvaluateNormal(sUVPoint, TRUE, TRUE, sParNormals[ii]); }
-            }
-        });
-    }
-
   // for every sFPB_PolyVertex - finish IndexValue assignments, cache PolyVertex data
   for(ULONG ii=0;ii<lNumPolyVertices;ii++)
     {
@@ -7967,7 +8099,7 @@ SmStatus SmTess::OutputFacePolygons
                                              lIndexCnt++ ;
                                              pEdgeuse = NULL ;
                                            }
-      else                                 { pEdgeuse = pPolyVertex->GetEdgeuse() ; }
+      else                                 { pEdgeuse = bParallel ? sParEdgeuses[ii] : pPolyVertex->GetEdgeuse() ; }
 
       // get PolyVertex UVPnt
       sUV = pPolyVertex->GetPoint();
@@ -8065,6 +8197,9 @@ SmStatus SmTess::OutputFacePolygons
       return SM_SUCCESS;
 
     } // end if SM_PO_CREATE_POLYBREP check
+
+  // get all PolyBrep PolyFaces
+  pFPB_PolyBrep->GetPolyFaces(sFPB_PolyFaces);
 
   // if you want quads, that should then be the first option to test RCLxx
   // Look for 4 sided polygons which are coplanar.
