@@ -6760,6 +6760,9 @@ struct SmPrecomputedDrop
   SmBoolean           bMadeSurfaceCache   = FALSE;  // the drop created the surface's cache
   SmBoolean           bBuiltSurfaceTree   = FALSE;  //   and built its tree
   SmBoolean           bUsedCurveCache     = FALSE;  // the drop asked for the curve's cache
+
+  // the same drop with the tolerance another drop of the edge may leave, owned
+  SmPrecomputedDrop * pVariant            = NULL;
 };
 
 // Curve cache built by a task
@@ -6952,6 +6955,26 @@ SmBoolean sm_IsSameSurfaceCopy(SmBSplineSurface * pSurface, SmBSplineSurface * p
   return TRUE;
 }
 
+// a new drop with the inputs of crDrop but another edge tolerance
+SmPrecomputedDrop * sm_NewDropVariant(const SmPrecomputedDrop & crDrop, double dZoneTol3d)
+{
+  SmPrecomputedDrop * pVariant = new SmPrecomputedDrop;
+  pVariant->pSurface            = crDrop.pSurface;
+  pVariant->lSurface            = crDrop.lSurface;
+  pVariant->pCurve              = crDrop.pCurve;
+  pVariant->cpContext           = crDrop.cpContext;
+  pVariant->sFaceDomain         = crDrop.sFaceDomain;
+  pVariant->sEdgeDomain         = crDrop.sEdgeDomain;
+  pVariant->sZoneTol3d          = dZoneTol3d;
+  pVariant->cpSurfaceNurb       = crDrop.cpSurfaceNurb;
+  pVariant->cpCurveNurb         = crDrop.cpCurveNurb;
+  pVariant->bSurfaceOutOfBounds = crDrop.bSurfaceOutOfBounds;
+  pVariant->bCurveOutOfBounds   = crDrop.bCurveOutOfBounds;
+  pVariant->bVertexDropsFail    = crDrop.bVertexDropsFail;
+  pVariant->sVertexPoint        = crDrop.sVertexPoint;
+  return pVariant;
+}
+
 } // end anonymous namespace
 
 /*******************************************************************//**
@@ -6994,6 +7017,12 @@ SmUVTrimCurvePrecompute::~SmUVTrimCurvePrecompute()
     {
       for (SmBSplineCurve * pUVCurve : rDrop.sUVCurves)
         { delete pUVCurve; }
+      if (rDrop.pVariant)
+        {
+          for (SmBSplineCurve * pUVCurve : rDrop.pVariant->sUVCurves)
+            { delete pUVCurve; }
+          delete rDrop.pVariant;
+        }
     }
   for (SmSurface * pMaster : pData->sMasters)
     { delete pMaster; }
@@ -7268,6 +7297,32 @@ void SmUVTrimCurvePrecompute::ComputeTask
   for (size_t ii = lBegin; ii < lEnd; ii++)
     { sm_ComputeDrop(*pData, pData->sDrops[pData->sTaskDrops[ii]]); }
 
+  // CreateUVTrimCurves() may increase the edge tolerance after a plain drop (SetUVTrimCurve()),
+  // and the edge's drops made later see it: drop them again with that tolerance as well
+  if (lEnd - lBegin > 1 && !pData->sDrops[pData->sTaskDrops[lBegin]].bVertexDropsFail)
+    {
+      for (size_t ii = lBegin; ii < lEnd; ii++)
+        {
+          const SmPrecomputedDrop & crFirst = pData->sDrops[pData->sTaskDrops[ii]];
+          if (!crFirst.bComputed || crFirst.eStatus != SM_SUCCESS || crFirst.sUVCurves.size() != 1)
+            { continue; }
+          double dCurrTol       = crFirst.sZoneTol3d;
+          double dMaxDistToSurf = smos_Sqrt(   crFirst.dMaxDistToSurf * crFirst.dMaxDistToSurf
+                                            + crFirst.dMaxApproxDev  * crFirst.dMaxApproxDev );
+          if (!(dCurrTol < 2.0 * dMaxDistToSurf))
+            { continue; }
+
+          for (size_t jj = lBegin; jj < lEnd; jj++)
+            {
+              SmPrecomputedDrop & rDrop = pData->sDrops[pData->sTaskDrops[jj]];
+              if (jj == ii || rDrop.pVariant != NULL)
+                { continue; }
+              rDrop.pVariant = sm_NewDropVariant(rDrop, 2.0 * dMaxDistToSurf);
+              sm_ComputeDrop(*pData, *rDrop.pVariant);
+            }
+        }
+    }
+
   // remember a curve cache built here, and the tolerance it was built with
   const SmCacheObj * cpCurveCache = pCurve->GetCacheObj();
   if (cpCurveCache != NULL && cpCurveCache != cpOldCurveCache)
@@ -7372,10 +7427,17 @@ SmBoolean SmUVTrimCurvePrecompute::UseDrop
   auto sIndex = pData->sDropIndex.find(sm_DropKey(cpEdgeuse));
   if (sIndex == pData->sDropIndex.end())
     { return FALSE; }
-  SmPrecomputedDrop & rDrop = pData->sDrops[sIndex->second];
-  if (rDrop.bUsed || !rDrop.bComputed)
+  SmPrecomputedDrop * pDrop = &pData->sDrops[sIndex->second];
+  if (pDrop->bUsed)
     { return FALSE; }
-  rDrop.bUsed = TRUE;
+  pDrop->bUsed = TRUE;
+  if (   pDrop->pVariant != NULL
+      && !sm_SameBits(sZoneTol3d.val, pDrop->sZoneTol3d.val)
+      && sm_SameBits(sZoneTol3d.val, pDrop->pVariant->sZoneTol3d.val))
+    { pDrop = pDrop->pVariant; }
+  if (!pDrop->bComputed)
+    { return FALSE; }
+  SmPrecomputedDrop & rDrop = *pDrop;
 
   // inputs must be unchanged
   const SmGeometryEditTracker * cpEditTracker = pData->cpEditTracker;
