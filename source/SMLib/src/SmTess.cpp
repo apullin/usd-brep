@@ -37,9 +37,82 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 // #define TIMER_CODE 1
+
+#ifndef SM_USE_TBB
+namespace {
+
+/********************************************************************
+   Phase 1 results computed on worker threads by SmTess::Phase1SetupBrep()
+   and adopted by its serial loops when their inputs are unchanged.
+*********************************************************************/
+
+// TRUE when notify callbacks are set for objects of cpContext
+SmBoolean sm_HasNotifyCallbacks(const SmContext * cpContext)
+{
+  SmContext * pContext = (SmContext *)cpContext;
+  return (   pContext->GetUserNotifyCallback() != NULL
+          || pContext->GetSysNotifyCallback()  != NULL) ? TRUE : FALSE;
+}
+
+// TRUE when Phase1SetupBrep() should compute on worker threads: there are worker threads and
+// enough work, no notify callbacks run for the objects created there (in the SmTess and face
+// contexts) and the surface tessellation tests are thread-safe (the view based driver changes
+// cache tolerances). SMLIB_TESS_SERIAL_PHASE1 disables it.
+SmBoolean sm_UsePhase1Precompute(const SmContext & crContext, const SmSurfaceTessDriver & crSurfaceTess,
+                                 const SmTArray<SmFace*> & crFaces)
+{
+  static const SmBoolean sbParallelPhase1 = (getenv("SMLIB_TESS_SERIAL_PHASE1") == NULL);
+  if (   !sbParallelPhase1
+      || sm_ParallelThreads() < 2
+      || crSurfaceTess.GetType() == SmViewBasedTessDriver_TYPE
+      || sm_HasNotifyCallbacks(&crContext))
+    { return FALSE; }
+  for (ULONG ii = 0; ii < crFaces.GetSize(); ii++)
+    {
+      const SmContext * cpFaceContext = crFaces[ii] ? crFaces[ii]->GetContext() : NULL;
+      if (cpFaceContext && cpFaceContext != &crContext && sm_HasNotifyCallbacks(cpFaceContext))
+        { return FALSE; }
+    }
+
+  // worth starting worker threads for: a curved face or many planar ones
+  if (crFaces.GetSize() >= 16)
+    { return TRUE; }
+  for (ULONG ii = 0; ii < crFaces.GetSize(); ii++)
+    {
+      const SmSurface * cpSurface = crFaces[ii] ? crFaces[ii]->GetSurface() : NULL;
+      if (cpSurface && !cpSurface->IsKindOf(SmPlane_TYPE))
+        { return TRUE; }
+    }
+  return FALSE;
+}
+
+// Surface tessellation cache of one face, built from a BSpline surface on a worker thread
+struct SmPrebuiltFaceCache
+{
+  std::unique_ptr<SmTessSrfCache> pSC;                    // owned until adopted
+  const SmBSplineSurface        * cpSurface    = NULL;    // face surface, NULL when not prebuilt
+  const gw_SURFACE              * cpNurb       = NULL;    // its NURB data
+  SmBoolean                       bOutOfBounds = FALSE;   // its out of bounds state, copied with the surface
+};
+
+// TRUE when CreateFaceTessCache(pFace) would build the same cache now
+SmBoolean sm_IsPrebuiltFaceCacheCurrent(const SmPrebuiltFaceCache & crPrebuilt, SmFace * pFace, const SmGeometryEditTracker & crEditTracker)
+{
+  SmBSplineSurface * pBSS = SM_CAST_PTR(SmBSplineSurface, pFace->GetSurface());
+  return (   pBSS != NULL
+          && pBSS == crPrebuilt.cpSurface
+          && pBSS->GetGwNurbPointer() == crPrebuilt.cpNurb
+          && pBSS->GetOutOfBoundsEnabled() == crPrebuilt.bOutOfBounds
+          && !pBSS->HasAttributes()
+          && !crEditTracker.WasEdited(pBSS)) ? TRUE : FALSE;
+}
+
+} // end anonymous namespace
+#endif // !SM_USE_TBB
 
 /*******************************************************************//**
 PURPOSE: Class SmUVTessCallback
@@ -12152,6 +12225,43 @@ SmStatus SmTess::Phase1SetupBrep
       if (pFace) m_vCache.RelatePair(pFace, pSC);
   }
   #else
+  // Phase 1 work computed on worker threads first and adopted below when its inputs
+  // are unchanged: the surface tessellation caches of BSpline faces (CreateFaceTessCache()
+  // only reads the face's surface).
+  std::vector<SmPrebuiltFaceCache>         sPrebuiltCaches;
+  std::unique_ptr<SmGeometryEditTracker>   pEditTracker;            // edits made after the worker threads ran
+  const SmBoolean bPrecompute = sFaces.GetSize() > 1 && sm_UsePhase1Precompute(m_crContext, m_rSurfaceTess, sFaces);
+  if (bPrecompute)
+    {
+      // CreateFaceTessCache() copies only the SmBSplineSurface part of the face surface
+      // (SmTessSrfCache::BuildTreeWithSubdivision()); copying attributes isn't thread-safe
+      sPrebuiltCaches.resize(sFaces.GetSize());
+      for (ii=0; ii<sFaces.GetSize(); ii++)
+        {
+          SmSurface        * pSurface = sFaces[ii] ? sFaces[ii]->GetSurface() : NULL;
+          SmBSplineSurface * pBSS     = SM_CAST_PTR(SmBSplineSurface, pSurface);
+          if (pBSS && pBSS->GetGwNurbPointer() && !pBSS->HasAttributes())
+            {
+              sPrebuiltCaches[ii].cpSurface    = pBSS;
+              sPrebuiltCaches[ii].cpNurb       = pBSS->GetGwNurbPointer();
+              sPrebuiltCaches[ii].bOutOfBounds = pBSS->GetOutOfBoundsEnabled();
+            }
+        }
+      sm_ParallelFor(tbb::blocked_range<ULONG>(0, sFaces.GetSize(), 1), [&](const tbb::blocked_range<ULONG> & crRange)
+        {
+          for (ULONG kk = crRange.begin(); kk != crRange.end(); ++kk)
+            {
+              SmTessSrfCache * pSC = NULL;
+              if (sPrebuiltCaches[kk].cpSurface && CreateFaceTessCache(sFaces[kk], pSC) == SM_SUCCESS)
+                { sPrebuiltCaches[kk].pSC.reset(pSC); }
+            }
+        });
+
+      pEditTracker.reset(new SmGeometryEditTracker);
+      for (const SmPrebuiltFaceCache & crPrebuilt : sPrebuiltCaches)
+        { if (crPrebuilt.pSC) pEditTracker->Watch(crPrebuilt.cpSurface); }
+    }
+
   // for every face - build its surface tessellation cache
   for (ii=0; ii<sFaces.GetSize(); ii++)
     {
@@ -12188,7 +12298,18 @@ SmStatus SmTess::Phase1SetupBrep
       //      m_dMaxAspectRatio);             // in : max allowed element basepolygon aspect ratio,            0.0 = ignore
       // and store in m_vCache.RelatePair(pFace,pSC).
       // m_pTessBrep is not modified.
-      eStat = CreateFaceTessCache( pFace );
+      if (   ii < sPrebuiltCaches.size()
+          && sPrebuiltCaches[ii].pSC
+          && sm_IsPrebuiltFaceCacheCurrent(sPrebuiltCaches[ii], pFace, *pEditTracker))
+        {
+          m_vCache.RelatePair(pFace,sPrebuiltCaches[ii].pSC.release());
+          eStat = SM_SUCCESS;
+        }
+      else
+        {
+          if (ii < sPrebuiltCaches.size()) { sPrebuiltCaches[ii].pSC.reset(); }
+          eStat = CreateFaceTessCache( pFace );
+        }
 
       if ( eStat != SM_SUCCESS )
         {

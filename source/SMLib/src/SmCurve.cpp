@@ -19352,6 +19352,7 @@ void SmCurve::Notify                   // expected calls: caller->Notify(Event, 
         case SM_NO_DESTRUCTION:
             // delete the object cache
             SmCacheMgr::DeleteObjectsCache(SM_OC_CURVE,this);
+            SmGeometryEditTracker::NoteEdit(this);
             break;
 
         case SM_NO_ADD_TO_BREP           : break ;

@@ -30557,6 +30557,7 @@ void SmSurface::Notify                 // expected calls: caller->Notify(Event, 
       case SM_NO_DESTRUCTION:
           SmCacheMgr::DeleteObjectsCache(SM_OC_TRIMSRF,this);
           // SmCacheMgr::DeleteObjectsCache(SM_OC_SURFACE,this);
+          SmGeometryEditTracker::NoteEdit(this);
           break;
 
       case SM_NO_ADD_TO_BREP           : break ;

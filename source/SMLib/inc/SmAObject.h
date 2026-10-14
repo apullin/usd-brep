@@ -149,6 +149,36 @@ public:
 
 }; // end class SmAObjecct
 
+/*******************************************************************//**
+PURPOSE: While in scope, the calling thread records which of the watched
+   curves and surfaces are edited (SM_NO_PRE_EDIT) or destroyed, so that
+   results computed from them earlier can be checked before they are used.
+
+NOTES: Edits made on other threads are not recorded.
+***********************************************************************/
+class SmGeometryEditTracker
+{
+public:
+  SmGeometryEditTracker();
+  ~SmGeometryEditTracker();
+
+  SmGeometryEditTracker(const SmGeometryEditTracker &) = delete;
+  SmGeometryEditTracker & operator=(const SmGeometryEditTracker &) = delete;
+
+  // records edits of cpObject from now on
+  void Watch(const SmAObject * cpObject);
+
+  // TRUE when cpObject is not watched or was edited or destroyed since it was watched
+  SmBoolean WasEdited(const SmAObject * cpObject) const;
+
+  // called by SmCurve::Notify() and SmSurface::Notify() for edits and destruction
+  static void NoteEdit(const SmAObject * cpObject);
+
+private:
+  void * m_pEdited;    // watched objects and their edit state
+  void * m_pPrevious;  // tracker that was active before this one
+} ;
+
 #endif // !__SMAOBJECT_H__
 
 

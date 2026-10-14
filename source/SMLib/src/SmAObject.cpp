@@ -12,6 +12,10 @@
 
 #include <SmRegion.h> // for SmAObject::Notify(SM_NO_REG_PROPAGATION) - GWC: this should be managed in some other way to avoid this inclusion
 
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+
 /*******************************************************************//**
 PURPOSE: Removes all attributes from the m_pAttributes list,
          deletes m_pAttributes,
@@ -1088,3 +1092,110 @@ void SmAObject::Dump(void)
 } // end SmAObject::Dump
 
 
+
+/********************************************************************
+   SmGeometryEditTracker
+*********************************************************************/
+namespace {
+
+struct SmEditedObjects
+{
+  static constexpr int sl_FilterBits = 16;
+
+  std::unordered_map<const SmAObject *, SmBoolean> sWatched;  // watched object -> edited
+  std::vector<uint64_t>                            sFilter = std::vector<uint64_t>((size_t(1) << sl_FilterBits) / 64, 0);
+  SmEditedObjects                                * pPrevious = NULL;
+
+  // bit of sFilter for an object; most objects passed to NoteEdit() are not watched
+  static size_t Bit(const SmAObject * cpObject)
+  {
+    return (size_t)(((uint64_t)(uintptr_t)cpObject >> 4) * 0x9E3779B97F4A7C15ull >> (64 - sl_FilterBits));
+  }
+};
+
+// innermost tracker of the calling thread
+SM_THREAD_LOCAL SmEditedObjects * t_pEditedObjects = NULL;
+
+} // end anonymous namespace
+
+/*******************************************************************//**
+PURPOSE: Start recording curve and surface edits on the calling thread.
+
+NOTES:
+***********************************************************************/
+SmGeometryEditTracker::SmGeometryEditTracker()
+{
+  SmEditedObjects * pEdited = new SmEditedObjects;
+  pEdited->pPrevious = t_pEditedObjects;
+  t_pEditedObjects   = pEdited;
+  m_pEdited          = pEdited;
+  m_pPrevious        = pEdited->pPrevious;
+
+} // end SmGeometryEditTracker::SmGeometryEditTracker
+
+/*******************************************************************//**
+PURPOSE: Stop recording and restore the previous tracker.
+
+NOTES: Trackers must be destroyed in reverse order of construction.
+***********************************************************************/
+SmGeometryEditTracker::~SmGeometryEditTracker()
+{
+  SmEditedObjects * pEdited = (SmEditedObjects *)m_pEdited;
+  SM_ASSERT(t_pEditedObjects == pEdited);
+  t_pEditedObjects = (SmEditedObjects *)m_pPrevious;
+  delete pEdited;
+
+} // end SmGeometryEditTracker::~SmGeometryEditTracker
+
+/*******************************************************************//**
+PURPOSE: Record edits of cpObject from now on.
+
+NOTES:
+***********************************************************************/
+void SmGeometryEditTracker::Watch
+ (const SmAObject * cpObject)   // in : curve or surface to watch
+{
+  SmEditedObjects * pEdited = (SmEditedObjects *)m_pEdited;
+  pEdited->sWatched.emplace(cpObject, FALSE);
+  size_t lBit = SmEditedObjects::Bit(cpObject);
+  pEdited->sFilter[lBit / 64] |= uint64_t(1) << (lBit % 64);
+
+} // end SmGeometryEditTracker::Watch
+
+/*******************************************************************//**
+PURPOSE: TRUE when cpObject is not watched, or was edited or destroyed
+   since it was watched.
+
+NOTES:
+***********************************************************************/
+SmBoolean SmGeometryEditTracker::WasEdited
+ (const SmAObject * cpObject)   // in : curve or surface to check
+ const
+{
+  const SmEditedObjects * pEdited = (const SmEditedObjects *)m_pEdited;
+  auto sWatched = pEdited->sWatched.find(cpObject);
+  return (sWatched == pEdited->sWatched.end() || sWatched->second) ? TRUE : FALSE;
+
+} // end SmGeometryEditTracker::WasEdited
+
+/*******************************************************************//**
+PURPOSE: Record an edit or destruction of cpObject in every tracker of
+   the calling thread that watches it.
+
+NOTES:
+***********************************************************************/
+void SmGeometryEditTracker::NoteEdit
+ (const SmAObject * cpObject)   // in : curve or surface being edited or destroyed
+{
+  for (SmEditedObjects * pEdited = t_pEditedObjects; pEdited != NULL; pEdited = pEdited->pPrevious)
+    {
+      size_t lBit = SmEditedObjects::Bit(cpObject);
+      if ((pEdited->sFilter[lBit / 64] >> (lBit % 64)) & 1)
+        {
+          auto sWatched = pEdited->sWatched.find(cpObject);
+          if (sWatched != pEdited->sWatched.end())
+            { sWatched->second = TRUE; }
+        }
+    }
+
+} // end SmGeometryEditTracker::NoteEdit
