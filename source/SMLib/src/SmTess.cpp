@@ -6527,6 +6527,7 @@ std::atomic<ULONG> lDebugCount(0);
     {
       ((SmBSplineSurface *)cpSurface)->GetOrCreateGwNurbPointer();  // built before sharing the surface
       sPlans.resize(lNumFaces);
+      SmDiagnosticCapture sCapture;  // diagnostics of the plans
       sm_ParallelFor(tbb::blocked_range<ULONG>(0, lNumFaces, 16), [&](const tbb::blocked_range<ULONG> & crRange)
         {
           // neighbor PolyFaces share vertices: memoize their normals and 1st derivatives
@@ -6543,6 +6544,12 @@ std::atomic<ULONG> lDebugCount(0);
                 { sm_PlanTriangulation(this, pSC, pPolyFace, NULL, NULL, sPlans[ii]); }
             }
         });
+      sCapture.Stop();
+
+      // when planning reported diagnostics, the loop below triangulates without plans, reporting
+      // as a serial run
+      if (!sCapture.IsEmpty())
+        { sPlans.clear(); }
     }
 #endif // !SM_USE_TESS_DEGREE && !SM_USE_TESS_SPLITFACE
 
@@ -8137,7 +8144,7 @@ SmStatus SmTess::OutputFacePolygons
   std::vector<SmVector3d>    sParNormals;
   std::vector<SmStatus>      sParPointStatus, sParNormalStatus;
   const SmBoolean bParallel     = lNumPolyVertices >= slMinParallelVertices;
-  const SmBoolean bParallelEval = bParallel && pSurf->GetType() == SmBSplineSurface_TYPE;
+  SmBoolean       bParallelEval = bParallel && pSurf->GetType() == SmBSplineSurface_TYPE;
   if (bParallel)
     {
       const SmBoolean bNormals = rPolygonOutput.GetGenerateNormals();
@@ -8150,6 +8157,7 @@ SmStatus SmTess::OutputFacePolygons
           sParPointStatus.assign(lNumPolyVertices, SM_ERR);
           sParNormalStatus.assign(lNumPolyVertices, SM_ERR);
         }
+      SmDiagnosticCapture sCapture;  // diagnostics of the evaluations
       sm_ParallelFor(tbb::blocked_range<ULONG>(0, lNumPolyVertices, 64), [&](const tbb::blocked_range<ULONG> & crRange)
         {
           for (ULONG ii = crRange.begin(); ii != crRange.end(); ++ii)
@@ -8167,6 +8175,12 @@ SmStatus SmTess::OutputFacePolygons
                 { sParNormalStatus[ii] = pSurf->EvaluateNormal(sUVPoint, TRUE, TRUE, sParNormals[ii]); }
             }
         });
+      sCapture.Stop();
+
+      // when evaluating reported diagnostics, the loop below evaluates again, reporting as a
+      // serial run
+      if (!sCapture.IsEmpty())
+        { bParallelEval = FALSE; }
     }
 
   // for every FBP_PolyVertex - init IndexValue assignments for PolyVertices with edgeuse
@@ -12267,6 +12281,7 @@ SmStatus SmTess::Phase1SetupBrep
       pUVTrimCurvePrecompute.reset(new SmUVTrimCurvePrecompute);
       pUVTrimCurvePrecompute->Prepare(sFaces);
 
+      SmDiagnosticCapture sCapture;  // diagnostics of the worker computations
       sm_ParallelInvoke(
         [&]
         {
@@ -12284,11 +12299,22 @@ SmStatus SmTess::Phase1SetupBrep
         {
           sm_ComputeUVTrimCurveTasks(*pUVTrimCurvePrecompute);
         });
+      sCapture.Stop();
 
-      pEditTracker.reset(new SmGeometryEditTracker);
-      for (const SmPrebuiltFaceCache & crPrebuilt : sPrebuiltCaches)
-        { if (crPrebuilt.pSC) pEditTracker->Watch(crPrebuilt.cpSurface); }
-      pUVTrimCurvePrecompute->Activate(pEditTracker.get());
+      // when computing the results reported diagnostics, the serial code computes them all
+      // again, reporting as a serial run
+      if (!sCapture.IsEmpty())
+        {
+          sPrebuiltCaches.clear();
+          pUVTrimCurvePrecompute.reset();
+        }
+      else
+        {
+          pEditTracker.reset(new SmGeometryEditTracker);
+          for (const SmPrebuiltFaceCache & crPrebuilt : sPrebuiltCaches)
+            { if (crPrebuilt.pSC) pEditTracker->Watch(crPrebuilt.cpSurface); }
+          pUVTrimCurvePrecompute->Activate(pEditTracker.get());
+        }
     }
 
   // for every face - build its surface tessellation cache
@@ -12582,9 +12608,17 @@ SmStatus SmTess::Phase1SetupBrep
       pUVTrimCurvePrecompute->Prepare(sFaces, TRUE);
       if (pUVTrimCurvePrecompute->GetTaskCount() > 0)
         {
+          // as above: when the tasks reported diagnostics, the serial code drops the curves itself
+          SmDiagnosticCapture sCapture;
           sm_ComputeUVTrimCurveTasks(*pUVTrimCurvePrecompute);
-          pEditTracker.reset(new SmGeometryEditTracker);
-          pUVTrimCurvePrecompute->Activate(pEditTracker.get());
+          sCapture.Stop();
+          if (!sCapture.IsEmpty())
+            { pUVTrimCurvePrecompute.reset(); }
+          else
+            {
+              pEditTracker.reset(new SmGeometryEditTracker);
+              pUVTrimCurvePrecompute->Activate(pEditTracker.get());
+            }
         }
     }
   #endif

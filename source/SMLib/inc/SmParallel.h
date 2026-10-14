@@ -18,6 +18,10 @@
 #include "tbb/task_group.h"
 #include <algorithm>
 #include <cstdlib>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 
 /*******************************************************************//**
 PURPOSE: Number of threads one kernel operation runs its TBB work on.
@@ -140,23 +144,125 @@ private:
   SmTol::ThreadDefaults m_sPrevious;
 };
 
+class SmTaskDiagnostics;
+
+/*******************************************************************//**
+PURPOSE: While in scope, the calling thread's kernel diagnostics are
+   recorded here instead of being reported: smos_ErrorMessage() and
+   smos_WriteBuffer() calls, which reach host error handlers, callbacks
+   and output files, and the NLib error state of N_ErrSet(), N_ErrClear()
+   and N_ErrGetType(), which is otherwise the process global NL_ERROR.
+
+NOTES: 1. Captures nest; stop or destroy them in reverse order, on the
+          thread that made them. Recording never throws: a diagnostic that
+          can't be recorded still makes the capture non-empty.
+       2. The sm_Parallel functions run every task in a capture and then
+          report the tasks' diagnostics on the calling thread, in the order
+          of a serial run of the tasks: worker threads never report.
+       3. Precomputations put a capture around those calls and discard
+          their results when it isn't empty: the serial code then computes
+          them again, reporting as a serial run.
+***********************************************************************/
+class SmDiagnosticCapture
+{
+public:
+  SmDiagnosticCapture();                                         // NLib error state of the calling thread
+  explicit SmDiagnosticCapture(const SmTaskDiagnostics & crTasks); // NLib error state of crTasks' calling thread
+  ~SmDiagnosticCapture();
+
+  SmDiagnosticCapture(const SmDiagnosticCapture &) = delete;
+  SmDiagnosticCapture & operator=(const SmDiagnosticCapture &) = delete;
+
+  // stops recording before the end of the scope; IsEmpty() still tells whether anything was recorded
+  void      Stop();
+  SmBoolean IsEmpty() const { return (m_sDiagnostics.empty() && !m_bLost) ? TRUE : FALSE; }
+
+  // for smos_ErrorMessage(), smos_WriteBuffer(), N_ErrSet() and N_ErrClear(): TRUE when the
+  // calling thread records diagnostics, which then records this call
+  static SmBoolean RecordErrorMessage(SmStatus      eError,
+                                      const TCHAR * pszFileName,
+                                      ULONG         lLineNumber,
+                                      const TCHAR * pszMessage,
+                                      const TCHAR * pszMessageForFile,
+                                      const TCHAR * pszFuncName);
+  static SmBoolean RecordWriteBuffer(const TCHAR * pszBuff, const TCHAR * pszBuffForFile, const TCHAR * pszBuffForDebugLog);
+  static SmBoolean RecordNLibError(long lError, const TCHAR * pszRoutine);
+  static SmBoolean RecordNLibErrorClear();
+
+  // for N_ErrGetType(): TRUE when the calling thread records diagnostics, with its NLib error number
+  static SmBoolean GetNLibError(long & rlError);
+
+  // one recorded call
+  struct Diagnostic
+  {
+    int                      eKind;       // SM_DK_* in SmParallel.cpp
+    long                     lNumber;     // error number or NLib error number
+    ULONG                    lLine;       // line number
+    const TCHAR            * pszRoutine;  // NLib routine name (static)
+    SmBoolean                bText[4];    // which texts were given
+    std::basic_string<TCHAR> sText[4];    // file, message, message for file, function / the three buffers
+  };
+
+private:
+  friend class SmTaskDiagnostics;
+
+  SmDiagnosticCapture   * m_pPrevious;     // capture that this one replaced on the thread
+  long                    m_lNLibError;    // NLib error number while recording
+  SmBoolean               m_bRecording;    // until Stop()
+  SmBoolean               m_bLost;         // a diagnostic could not be recorded
+  std::vector<Diagnostic> m_sDiagnostics;  // in order
+};
+
+/*******************************************************************//**
+PURPOSE: Diagnostics of the tasks of one sm_Parallel call, which the
+   calling thread reports afterwards in task order (SmDiagnosticCapture).
+***********************************************************************/
+class SmTaskDiagnostics
+{
+public:
+  SmTaskDiagnostics();   // on the calling thread
+
+  SmTaskDiagnostics(const SmTaskDiagnostics &) = delete;
+  SmTaskDiagnostics & operator=(const SmTaskDiagnostics &) = delete;
+
+  // on any thread: keeps the diagnostics of task lTask (tasks run serially in lTask order)
+  void Add(size_t lTask, SmDiagnosticCapture & rCapture);
+
+  // on the calling thread: reports the tasks' diagnostics as a serial run of the tasks
+  void Report();
+
+private:
+  friend class SmDiagnosticCapture;
+  typedef std::pair<size_t, std::vector<SmDiagnosticCapture::Diagnostic>> Task;
+
+  long              m_lNLibError;  // of the calling thread
+  std::mutex        m_sMutex;
+  std::vector<Task> m_sTasks;      // tasks with diagnostics
+  SmBoolean         m_bLost;       // a task's diagnostic could not be recorded
+};
+
 /*******************************************************************//**
 PURPOSE: tbb::parallel_for() for kernel work: isolated and capped as in
    sm_RunIsolated(), and every chunk runs with the calling thread's
-   tolerance defaults, as it would on the calling thread.
+   tolerance defaults, as it would on the calling thread. The calling
+   thread reports the chunks' diagnostics afterwards (SmDiagnosticCapture).
 ***********************************************************************/
 template <class Range, class Body>
 void sm_ParallelFor(const Range & crRange, const Body & crBody)
 {
   const SmTol::ThreadDefaults sDefaults = SmTol::GetThreadDefaults();
+  SmTaskDiagnostics sDiagnostics;
   sm_RunIsolated([&]
     {
       tbb::parallel_for(crRange, [&](const Range & crChunk)
         {
           SmThreadDefaultsScope sScope(sDefaults);
+          SmDiagnosticCapture   sCapture(sDiagnostics);
           crBody(crChunk);
+          sDiagnostics.Add((size_t)crChunk.begin(), sCapture);
         });
     });
+  sDiagnostics.Report();
 }
 
 template <class Index, class Function>
@@ -176,11 +282,25 @@ template <class F1, class F2>
 void sm_ParallelInvoke(const F1 & crF1, const F2 & crF2)
 {
   const SmTol::ThreadDefaults sDefaults = SmTol::GetThreadDefaults();
+  SmTaskDiagnostics sDiagnostics;
   sm_RunIsolated([&]
     {
-      tbb::parallel_invoke([&] { SmThreadDefaultsScope sScope(sDefaults); crF1(); },
-                           [&] { SmThreadDefaultsScope sScope(sDefaults); crF2(); });
+      tbb::parallel_invoke([&]
+                             {
+                               SmThreadDefaultsScope sScope(sDefaults);
+                               SmDiagnosticCapture   sCapture(sDiagnostics);
+                               crF1();
+                               sDiagnostics.Add(0, sCapture);
+                             },
+                           [&]
+                             {
+                               SmThreadDefaultsScope sScope(sDefaults);
+                               SmDiagnosticCapture   sCapture(sDiagnostics);
+                               crF2();
+                               sDiagnostics.Add(1, sCapture);
+                             });
     });
+  sDiagnostics.Report();
 }
 
 #endif // !__SMPARALLEL_H__

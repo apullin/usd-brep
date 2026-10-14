@@ -19,6 +19,7 @@ static int nInitEnd = 0;
 #include <nurbs.h>
 #include <NL_Globals.h>
 #include <memory.h>
+#include <SmParallel.h>
 
 #ifdef SM_USE_TBB_SCALABLE
 #include "tbb/scalable_allocator.h"
@@ -8572,8 +8573,13 @@ NL_VOID N_FreeCPt3dArray( NL_CPOINT *** c3d, NL_STACKS *S )
 
    ***********************************************************************/
 
-NL_VOID N_ErrSet( NL_INTEGER err, const TCHAR * rname )
+NL_NOINLINE NL_VOID N_ErrSet( NL_INTEGER err, const TCHAR * rname )
 {
+    /* kernel work on worker threads keeps its own error state (SmDiagnosticCapture); */
+    /* not inlined, to keep this out of the many callers, some of them hot */
+    if( SmDiagnosticCapture::RecordNLibError( err, rname ) )
+        return;
+
     NL_ERROR.eno = err;
     NL_ERROR.fna = (NL_STRING)rname;
 } /* end N_ErrSet */
@@ -8600,8 +8606,12 @@ NL_VOID N_ErrSet( NL_INTEGER err, const TCHAR * rname )
 
    ***********************************************************************/
 
-NL_VOID N_ErrClear( NL_VOID )
+NL_NOINLINE NL_VOID N_ErrClear( NL_VOID )
 {
+    /* kernel work on worker threads keeps its own error state (SmDiagnosticCapture) */
+    if( SmDiagnosticCapture::RecordNLibErrorClear() )
+        return;
+
     NL_ERROR.eno = 0;
     NL_ERROR.fna = _T(" ");
 } /* end N_ErrClear */
@@ -8854,7 +8864,12 @@ NL_FLAG N_CheckCPtMatStorage( NL_CMATRIX *cma, NL_INDEX nr, NL_INDEX mc, NL_STRI
 
    ***********************************************************************/
 
-NL_INTEGER N_ErrGetType( NL_VOID )
+NL_NOINLINE NL_INTEGER N_ErrGetType( NL_VOID )
 {
+    /* kernel work on worker threads keeps its own error state (SmDiagnosticCapture) */
+    long lError;
+    if( SmDiagnosticCapture::GetNLibError( lError ) )
+        return (lError);
+
     return (NL_ERROR.eno);
 }

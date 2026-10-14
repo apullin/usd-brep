@@ -35,6 +35,7 @@
 #endif
 
 #include <SmGraphicsVertexArray.h>
+#include <SmParallel.h>
 
 #ifdef SM_USE_EXCEPTIONS
 #include <new>
@@ -297,6 +298,10 @@ void smos_ErrorMessage
    const TCHAR * const func_name)      // in :
 
 {
+  // kernel work on worker threads records this for the calling thread to report (SmDiagnosticCapture)
+  if (SmDiagnosticCapture::RecordErrorMessage(error, file_name, line_num, message, messageForFile, func_name))
+    { return; }
+
   if( c3d_smlib_error_handler != NULL ) 
     {
         c3d_smlib_error_handler(error, file_name, line_num, messageForFile ? messageForFile : message);
@@ -457,6 +462,10 @@ void smos_WriteBuffer
   const TCHAR* pBuffForFile,      // in : When not NULL string sent to stdout instead of pBuff, default NULL
   const TCHAR* pBuffForDebugLog)  // in : When not NULL string sent to stdout instead of pBuff, default NULL
 {
+  // kernel work on worker threads records this for the calling thread to report (SmDiagnosticCapture)
+  if (SmDiagnosticCapture::RecordWriteBuffer(pBuff, pBuffForFile, pBuffForDebugLog))
+    { return; }
+
   // check input
   SmBoolean bInput = (pBuff || pBuffForFile || pBuffForDebugLog) ;
 

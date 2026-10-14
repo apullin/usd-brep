@@ -4992,7 +4992,8 @@ NOTES:
      instead when an earlier node in depth first order left the switch set.
   3. A serial walk replays the switch to find the block nodes, whose
      subdivisions are then computed on worker threads.
-  4. The serial recursion runs last, looking up these results.
+  4. The serial recursion runs last, looking up these results, or without
+     them when computing them reported diagnostics (SmDiagnosticCapture).
   5. Callers must ensure TestAgainstTolerances() is thread-safe: no view
      based driver, no notify callbacks and no subdivision surface attributes.
 ***********************************************************************/
@@ -5164,6 +5165,7 @@ SmStatus SmSurfaceCache::SubdivideToTolerancesParallel
   } ; // end struct Worker
 
   const Worker sWorker = {this, m_eTessellationAlgorithm == SM_TA_FASTER_TESSELLATION};
+  SmDiagnosticCapture sCapture;  // diagnostics of the worker computations
   sWorker.Explore(pRoot.get());
 
   // Replay the serial depth first recursion and its m_bSwitchToFastSubdivision
@@ -5195,6 +5197,12 @@ SmStatus SmSurfaceCache::SubdivideToTolerancesParallel
       }
   }
   sm_ParallelFor(size_t(0), sBlocks.size(), [&](size_t ii) { sWorker.Block(sBlocks[ii]); });
+  sCapture.Stop();
+
+  // when computing the results reported diagnostics, the serial recursion computes them all
+  // again, reporting as a serial run
+  if (!sCapture.IsEmpty())
+    { return SubdivideToTolerances(pTree, pTopNode, NULL); }
 
   // serial recursion with lookups
   SmRefinePrecompute sPrecompute;
