@@ -15511,7 +15511,11 @@ NOTES:
 SmTessSrfCache::~SmTessSrfCache()
 {
   // SM_ASSERT(m_pPolyBrep != NULL) ;
-  if(mTS_pPolyBrep) { delete mTS_pPolyBrep ; mTS_pPolyBrep = NULL ; }
+  if(mTS_pPolyBrep)
+    {
+      mTS_pPolyBrep->DeleteTopologyForDestruction() ;
+      delete mTS_pPolyBrep ; mTS_pPolyBrep = NULL ;
+    }
 
 } // end SmTessSrfCache::~SmTessSrfCache destructor
 

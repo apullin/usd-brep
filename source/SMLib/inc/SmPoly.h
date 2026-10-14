@@ -2034,6 +2034,12 @@ protected:
                                                 // pointers are valid and this value is TRUE.
                                                 // After tessellation the back pointers are stale and this value is FALSE.
 
+private:
+  // When the whole graph of a large PolyBrep has nothing for destructors to clean up outside it, delete all
+  // topology without unlinking (partly on worker threads); else leave it to ~SmPolyBrep().
+  // Precondition: this PolyBrep is deleted right after, and nothing else uses its topology meanwhile.
+  void DeleteTopologyForDestruction();
+
 public:
   // constructor:    SmPolyBrep *pPolyBrep = new (crContext) SmPolyBrep(args...) ;
   SmPolyBrep(SmZoneTol3d dZoneTol3d,

@@ -41,6 +41,11 @@
 // For MACOSX and Linux
 #include <iostream>
 #include <unordered_set>
+#include <atomic>
+#include <vector>
+
+#include "tbb/parallel_for.h"
+#include <SmParallel.h>
 
 #ifdef USE_DEBUG_COUNTER
 static ULONG s_lFaceCount = 1;
@@ -679,6 +684,224 @@ SmPolyBrep::~SmPolyBrep()
     { if(m_cpContext) { delete m_cpContext; m_cpContext = NULL; } }
 
 } // end SmPolyBrep destructor
+
+/*******************************************************************//**
+PURPOSE: DeleteTopologyForDestruction() helper: call fVisit for every member
+  of a list in SmOwningTopology::GetAll() order.
+
+NOTES: Reads each next member before fVisit, which may delete the current
+  one. Returns FALSE, possibly after some calls, when fVisit returns FALSE
+  or when GetAll() would signal an error for a list longer than its count.
+  Allocates nothing.
+***********************************************************************/
+template <class Visit>
+static SmBoolean sm_VisitCheckedList
+ (const SmOwningTopology * cpOwner,  // in : list owner
+  const Visit            & fVisit)   // in : SmBoolean fVisit(SmTopology *), FALSE = stop
+{
+  SmTopology *pHead  = cpOwner->GetList();
+  SmTopology *pElem  = pHead;
+  ULONG       lCount = 0;
+  while(pElem)
+    {
+      if(lCount++ >= cpOwner->GetSize())
+        { return FALSE ; }
+      SmTopology *pNext = pElem->GetNext();
+      if(!fVisit(pElem))
+        { return FALSE ; }
+      pElem = pNext;
+      if(pElem == pHead)
+        { break ; }
+    }
+  return TRUE ;
+
+} // end sm_VisitCheckedList
+
+/*******************************************************************//**
+PURPOSE: Delete the topology of a large PolyBrep that is about to be deleted,
+  or leave it to ~SmPolyBrep().
+
+NOTES: Precondition: the caller deletes this PolyBrep right after, and no
+  other thread uses its topology meanwhile; used by ~SmTessSrfCache.
+
+  Acts only when a check of the whole graph, on worker threads, finds plain
+  PolyFaces in consistent lists, every object listed by its owner, and
+  nothing that has attributes, caches or AuxData, or a Brep back pointer
+  to clear. Then no destructor reaches outside the graph, so each PolyEdge,
+  PolyLoop, PolyFace and PolyVertex is detached from its neighbors before
+  it is deleted, which skips the unlinking, and the PolyFaces are deleted
+  on worker threads. Otherwise, and for small PolyBreps, it does nothing.
+
+  Throws nothing: an exception while checking leaves the graph as it was,
+  and the PolyFaces a throwing parallel deletion leaves are deleted here.
+***********************************************************************/
+void SmPolyBrep::DeleteTopologyForDestruction()
+{
+  static constexpr ULONG slMinParallelFaces = 2048;
+
+  // no work - few PolyFaces
+  ULONG lNumFaces = 0;
+  sm_VisitCheckedList(this, [&](SmTopology * pRegion) -> SmBoolean
+    {
+      return sm_VisitCheckedList((SmPolyRegion *)pRegion, [&](SmTopology * pShell) -> SmBoolean
+        {
+          lNumFaces += ((SmPolyShell *)pShell)->GetSize();
+          return TRUE ;
+        });
+    });
+  if(lNumFaces < slMinParallelFaces || m_pCPolyFaceListHead->GetList() != NULL)
+    { return; }
+
+  // Detach PolyFace with its PolyLoops and PolyEdges, deleting them. Allocates nothing.
+  auto DeleteDetachedPolyFace = [](SmPolyFace * pPolyFace)
+    {
+      sm_VisitCheckedList(pPolyFace, [](SmTopology * pLoop) -> SmBoolean
+        {
+          SmPolyLoop *pPolyLoop = (SmPolyLoop *)pLoop;
+          sm_VisitCheckedList(pPolyLoop, [](SmTopology * pEdge) -> SmBoolean
+            {
+              SmPolyEdge *pPolyEdge = (SmPolyEdge *)pEdge;
+              pPolyEdge->m_pNextRadialE = pPolyEdge;
+              pPolyEdge->m_pLastRadialE = pPolyEdge;
+              pPolyEdge->m_pPolyVertex  = NULL;
+              pPolyEdge->m_pListOwner   = NULL;
+              delete pPolyEdge ;
+              return TRUE ;
+            });
+          pPolyLoop->m_pListOwner = NULL;
+          delete pPolyLoop ;
+          return TRUE ;
+        });
+      pPolyFace->m_pListOwner = NULL;
+      delete pPolyFace ;
+    };
+
+  // Gather and check the whole graph. Nothing is modified yet, so on a failed
+  // check or an exception ~SmPolyBrep() deletes the topology as before.
+  std::vector<SmPolyRegion*> sRegions;
+  std::vector<std::size_t>   sRegionShellEnds;  // end of each PolyRegion's PolyShells in sShells
+  std::vector<SmPolyShell*>  sShells;
+  std::vector<SmPolyFace*>   sFaces;
+  std::vector<SmPolyShell*>  sFaceShells;       // PolyShell listing sFaces[ff]
+  std::vector<SmPolyVertex*> sVertices;
+  std::vector<unsigned char> sDeleted;          // TRUE = sFaces[ff] deleted
+  try
+    {
+      SmBoolean bGathered = sm_VisitCheckedList(this, [&](SmTopology * pRegion) -> SmBoolean
+        {
+          SmPolyRegion *pPolyRegion = (SmPolyRegion *)pRegion;
+          if(pPolyRegion->m_pListOwner != this || pPolyRegion->HasAttributes() || pPolyRegion->GetCacheObj())
+            { return FALSE ; }
+          sRegions.push_back(pPolyRegion);
+          SmBoolean bShells = sm_VisitCheckedList(pPolyRegion, [&](SmTopology * pShell) -> SmBoolean
+            {
+              SmPolyShell *pPolyShell = (SmPolyShell *)pShell;
+              if(pPolyShell->m_pListOwner != pPolyRegion || pPolyShell->HasAttributes() || pPolyShell->GetCacheObj())
+                { return FALSE ; }
+              sShells.push_back(pPolyShell);
+              return sm_VisitCheckedList(pPolyShell, [&](SmTopology * pFace) -> SmBoolean
+                {
+                  sFaces.push_back((SmPolyFace *)pFace);
+                  sFaceShells.push_back(pPolyShell);
+                  return TRUE ;
+                });
+            });
+          sRegionShellEnds.push_back(sShells.size());
+          return bShells ;
+        });
+      bGathered = bGathered && sm_VisitCheckedList(m_pPolyVertexListHead, [&](SmTopology * pVertex) -> SmBoolean
+        {
+          sVertices.push_back((SmPolyVertex *)pVertex);
+          return TRUE ;
+        });
+      if(!bGathered)
+        { return; }
+      sDeleted.assign(sFaces.size(), FALSE);
+
+      // check every PolyFace with its PolyLoops and PolyEdges, and every PolyVertex, on worker threads
+      std::atomic<SmBoolean> bDetachable(TRUE);
+      sm_ParallelFor(tbb::blocked_range<std::size_t>(0, sFaces.size(), 64), [&](const tbb::blocked_range<std::size_t> & crRange)
+        {
+          for(std::size_t ff = crRange.begin(); ff != crRange.end() && bDetachable; ++ff)
+            {
+              SmPolyFace *pPolyFace = sFaces[ff];
+              if(   pPolyFace->m_pListOwner != sFaceShells[ff] || pPolyFace->GetType() != SmPolyFace_TYPE
+                 || pPolyFace->HasAttributes() || pPolyFace->GetCacheObj()
+                 || (pPolyFace->m_pCPolyFace != NULL && pPolyFace->m_pCPolyFace != pPolyFace)
+                 || !sm_VisitCheckedList(pPolyFace, [&](SmTopology * pLoop) -> SmBoolean
+                      {
+                        SmPolyLoop *pPolyLoop = (SmPolyLoop *)pLoop;
+                        if(pPolyLoop->m_pListOwner != pPolyFace || pPolyLoop->HasAttributes() || pPolyLoop->GetCacheObj())
+                          { return FALSE ; }
+                        return sm_VisitCheckedList(pPolyLoop, [&](SmTopology * pEdge) -> SmBoolean
+                          {
+                            SmPolyEdge *pPolyEdge = (SmPolyEdge *)pEdge;
+                            return(   pPolyEdge->m_pListOwner == pPolyLoop && pPolyEdge->GetContext() != NULL
+                                   && !pPolyEdge->m_pAuxData && !pPolyEdge->HasAttributes() && !pPolyEdge->GetCacheObj()
+                                   && (   pPolyEdge->m_pPolyVertex == NULL
+                                       || pPolyEdge->m_pPolyVertex->m_pListOwner == m_pPolyVertexListHead)) ;
+                          });
+                      }))
+                { bDetachable = FALSE; }
+            }
+        });
+      if(bDetachable)
+        {
+          sm_ParallelFor(tbb::blocked_range<std::size_t>(0, sVertices.size(), 256), [&](const tbb::blocked_range<std::size_t> & crRange)
+            {
+              for(std::size_t vv = crRange.begin(); vv != crRange.end() && bDetachable; ++vv)
+                {
+                  SmPolyVertex *pPolyVertex = sVertices[vv];
+                  if(   pPolyVertex->m_pListOwner != m_pPolyVertexListHead
+                     || pPolyVertex->HasAttributes() || pPolyVertex->GetCacheObj()
+                     || (   m_bOKBackPtrs == TRUE && pPolyVertex->GetOriginalVertex()
+                         && pPolyVertex->GetOriginalVertex()->GetPolyVertex() == pPolyVertex))
+                    { bDetachable = FALSE; }
+                }
+            });
+        }
+      if(!bDetachable)
+        { return; }
+    }
+  catch(...)
+    { return; }
+
+  // delete the PolyFaces on worker threads, then any that a throwing parallel loop left
+  try
+    {
+      sm_ParallelFor(tbb::blocked_range<std::size_t>(0, sFaces.size(), 64), [&](const tbb::blocked_range<std::size_t> & crRange)
+        {
+          for(std::size_t ff = crRange.begin(); ff != crRange.end(); ++ff)
+            {
+              DeleteDetachedPolyFace(sFaces[ff]);
+              sDeleted[ff] = TRUE;
+            }
+        });
+    }
+  catch(...)
+    { }
+  for(std::size_t ff = 0; ff < sFaces.size(); ++ff)
+    {
+      if(!sDeleted[ff])
+        { DeleteDetachedPolyFace(sFaces[ff]); }
+    }
+
+  // delete the PolyShells and PolyRegions, then the PolyVertices detached, in ~SmPolyBrep() order
+  std::size_t lShell = 0;
+  for(std::size_t rr = 0; rr < sRegions.size(); ++rr)
+    {
+      for(; lShell < sRegionShellEnds[rr]; ++lShell)
+        { delete sShells[lShell] ; }
+      delete sRegions[rr] ;
+    }
+  for(SmPolyVertex * pPolyVertex : sVertices)
+    {
+      pPolyVertex->m_pListOwner = NULL;
+      delete pPolyVertex ;
+    }
+  m_pPolyVertexListHead->UpdateList(NULL);
+
+} // end SmPolyBrep::DeleteTopologyForDestruction
 
 /*******************************************************************//**
 PURPOSE: Split edges of a face near vertices less than the given tolerance.  
