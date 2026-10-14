@@ -8677,8 +8677,10 @@ SmStatus SmTess::TriangulateSingleFace
       SmPolyLoop * pNewPolyLoop  = NULL ;
       SmPolyFace * pNewPolyFace  = NULL ;
 
+      // only needed to connect inner loops
       SmTArray<SmPolyEdge*> sNonDegenPolyEdges;
-      pPolyFace->GetNonDegeneratePolyEdges(sNonDegenPolyEdges);
+      if (sPolyLoops.GetSize() > 1)
+        { pPolyFace->GetNonDegeneratePolyEdges(sNonDegenPolyEdges); }
 
       // while pPolyFace has inner loops
       while ( sPolyLoops.GetSize() > 1 )
