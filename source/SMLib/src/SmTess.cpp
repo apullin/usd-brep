@@ -34,6 +34,7 @@
 
 #include "tbb/parallel_for.h"
 #include <SmParallel.h>
+#include <cstring>
 #include <vector>
 
 // #define TIMER_CODE 1
@@ -5323,6 +5324,434 @@ static void CreatePolygonsFromInsidePartsOfTree
 #endif
 } // end Graphisoft CreatePolygonsFromInsidePartsOfTree
 
+// Plans follow TriangulateSingleFace() without its SM_USE_TESS_DEGREE and SM_USE_TESS_SPLITFACE variants
+#if !defined(SM_USE_TESS_DEGREE) && !defined(SM_USE_TESS_SPLITFACE)
+/*******************************************************************//**
+   Triangulation plans for SmTess::AddQuadBoundaries().
+
+   TriangulateFace() of a PolyFace with one closed outer PolyLoop makes a
+   single TriangulateSingleFace() call: a convex quad is split along its
+   shorter diagonal, any other polygon loses its best scored corner triangle
+   per iteration until a triangle remains. The corner scores are pure
+   geometry, so the corners of many PolyFaces are planned on worker threads
+   first. The serial loop then makes the same Mark() and MakeManifoldEdge()
+   calls in place of TriangulateFace(). Cases the plans don't cover (inner
+   loops, corners without a usable score, inside vertices) and PolyFaces
+   edited since they were planned still run TriangulateFace().
+***********************************************************************/
+namespace {
+
+// Planned TriangulateFace() of one PolyFace
+struct SmTriangulationPlan
+{
+  SmBoolean                  bValid      = FALSE;  // TRUE = make the planned splits instead of calling TriangulateFace()
+  SmBoolean                  bVertexTree = FALSE;  // TRUE = TriangulateSingleFace() general case: NewMark(), then Mark() before every split
+  std::vector<SmPolyEdge*>   sPolyEdges;           // PolyLoop PolyEdges in order when planned
+  std::vector<SmPolyVertex*> sPolyVertices;        // their start PolyVertices
+  std::vector<SmPoint3d>     sPoints;              // their start points
+  std::vector<ULONG>         sSplits;              // per MakeManifoldEdge(): start, end and triangle PolyEdge ids
+                                                   //   ids: sPolyEdges index, then 2 per split for the new PolyEdge and its radial
+};
+
+} // end anonymous namespace
+
+/*******************************************************************//**
+PURPOSE: FindInsideVertices() for a corner of a planned PolyFace.
+
+NOTES: TRUE when a PolyEdge of the PolyFace has its start point inside
+       Tri[P0,P1,P2]. TriangulateSingleFace() never splits off corners with
+       inside vertices, so only this result of the vertex tree search is
+       needed - its other outputs depend on the tree order.
+***********************************************************************/
+static SmStatus sm_PlanHasInsideVertex
+ (const SmPoint3d              & crP0,         // in : P0 of Tri[P0,P1,P2]
+  const SmPoint3d              & crP1,         // in : P1 of Tri[P0,P1,P2]
+  const SmPoint3d              & crP2,         // in : P2 of Tri[P0,P1,P2]
+  double                         dTol,         // in : PolyFace tolerance
+  const std::vector<ULONG>     & crFaceEdges,  // in : PolyFace PolyEdge ids
+  const std::vector<SmPoint3d> & crPoints,     // in : start point of every PolyEdge id
+  SmBoolean                    & rbInside)     // out: TRUE = a PolyFace PolyVertex is inside Tri[P0,P1,P2]
+{
+  // as SmPolyFace::FindVerticesInTriangle(), 2d pass
+  rbInside = FALSE;
+
+  // triangle bounding box
+  SmExtent3d sTriBBox( crP0 );
+  sTriBBox.AddPoint3d( crP1 );
+  sTriBBox.AddPoint3d( crP2 );
+  sTriBBox.ExpandAbsolute(dTol*10.0) ;
+
+  // Get corner to corner vectors
+  SmVector3d sP0P1 = crP1 - crP0;
+  SmVector3d sP0P2 = crP2 - crP0;
+  SmVector3d sP2P0 = crP0 - crP2;
+  SmVector3d sP2P1 = crP1 - crP2;
+
+  // get unit_normal at triangle corner P0
+  SmVector3d sCross = sP0P1 * sP0P2;
+  if(sCross.LengthSquared() < SM_EFF_ZERO_SQ)
+    { return SM_SUCCESS; } // Points are collinear: won't contain any vertices.
+  SER(sCross.Unitize());
+
+  // get AngRad(P2,P0,P1) and AngRad(P1,P2,P0) at Triangle corners P0 and P2
+  double dTriAngRad1, dTriAngRad2 ;
+  SER(sCross.CCWAngleBetween(sP0P1,sP0P2,dTriAngRad1));
+  SER(sCross.CCWAngleBetween(sP2P0,sP2P1,dTriAngRad2));
+
+  // for every PolyFace PolyEdge
+  for(ULONG ii=0;ii<crFaceEdges.size();ii++)
+    {
+      const SmPoint3d & sPTest = crPoints[crFaceEdges[ii]] ;
+      if(!sTriBBox.ContainsPoint3d(sPTest))
+        { continue; }
+
+      // vec(P0, PTest), vec(P2, PTest)
+      SmVector3d sP0PT = sPTest - crP0;
+      SmVector3d sP2PT = sPTest - crP2;
+
+      // skip points coincident with P0, P1 and P2
+      if(sP0PT.LengthSquared() < dTol*dTol)
+        { continue; }
+      if(sPTest.DistanceBetweenSquared(crP1) < dTol*dTol)
+        { continue; }
+      if(sP2PT.LengthSquared() < dTol*dTol)
+        { continue; }
+
+      // corner angles(pTest,P0,P1) and (pTest,P2,P0)
+      double dTestAngRad1, dTestAngRad2 ;
+      SER(sCross.CCWAngleBetween(sP0P1, sP0PT, dTestAngRad1));
+      dTestAngRad1 = SM_CLAMP_PERIODIC_RAD(dTestAngRad1) ;
+      SER(sCross.CCWAngleBetween(sP2P0,sP2PT,dTestAngRad2));
+      dTestAngRad2 = SM_CLAMP_PERIODIC_RAD(dTestAngRad2) ;
+
+      // skip points outside of the angles at vertices P0 and P2
+      if(dTestAngRad1 > dTriAngRad1 + SM_EFF_ZERO_SQRT)
+        { continue; }
+      if(dTestAngRad2 > dTriAngRad2 + SM_EFF_ZERO_SQRT)
+        { continue; }
+
+      // the point is inside of the triangle
+      rbInside = TRUE;
+      return SM_SUCCESS;
+    }
+
+  return SM_SUCCESS;
+
+} // end sm_PlanHasInsideVertex
+
+/*******************************************************************//**
+PURPOSE: Plan TriangulateFace(pPolyFace) for a PolyFace with one closed,
+         outer PolyLoop.
+
+NOTES: Returns FALSE when TriangulateFace() must run. Pure: reads the
+       PolyFace, its surface and the surface cache without editing them.
+       Follows the TriangulateSingleFace() cases for a single PolyLoop.
+***********************************************************************/
+static SmBoolean sm_PlanTriangulation
+ (const SmTess        * cpTess,      // in : tessellator for CheckAgainstSurfaceCache()
+  SmTessSrfCache      * pTessCache,  // in : PolyFace->OriginalFace surface cache
+  SmPolyFace          * pPolyFace,   // in : PolyFace to plan
+  SmTriangulationPlan & rPlan)       // out: plan, when TRUE is returned
+{
+  constexpr ULONG BAD_SCORE = 999999;  // as TriangulateSingleFace()
+  constexpr ULONG lMaxEdges = 256;     // larger PolyFaces use TriangulateFace() and its vertex tree
+
+  // PolyLoop PolyEdges, their start PolyVertices and points
+  SM_PTR_ARRAY(sLoopEdges, SmPolyEdge, 64) ;
+  pPolyFace->GetPolyEdges(sLoopEdges);
+  ULONG lNumLoopEdges = sLoopEdges.GetSize();
+  if (lNumLoopEdges > lMaxEdges)
+    { return FALSE; }
+  rPlan.sPolyEdges.assign(sLoopEdges.GetDataArray(), sLoopEdges.GetDataArray() + lNumLoopEdges);
+  rPlan.sPolyVertices.resize(lNumLoopEdges);
+  rPlan.sPoints.resize(lNumLoopEdges);
+  for (ULONG ii = 0; ii < lNumLoopEdges; ii++)
+    {
+      // expect PolyEdge end = next PolyEdge start, no single vertex loops
+      SmPolyEdge   * pPolyEdge = sLoopEdges[ii];
+      SmPolyVertex * pVertex   = pPolyEdge->GetStartPolyVertex();
+      if (   pVertex == NULL
+          || pVertex->IsSingleVertexLoop()
+          || pPolyEdge->GetEndPolyVertex() != sLoopEdges[(ii + 1) % lNumLoopEdges]->GetStartPolyVertex())
+        { return FALSE; }
+      rPlan.sPolyVertices[ii] = pVertex;
+      rPlan.sPoints[ii]       = pVertex->GetPoint();
+    }
+
+  // case 1 - triangle or degenerate polygon - no work
+  if (lNumLoopEdges <= 3)
+    {
+      rPlan.bValid = TRUE;
+      return TRUE;
+    }
+
+  // PolyEdge ids: start PolyVertices and points
+  std::vector<SmPolyVertex*> sVertices(rPlan.sPolyVertices);
+  std::vector<SmPoint3d>     sPoints(rPlan.sPoints);
+  SmFace                   * pOriginalFace = pPolyFace->GetOriginalFace();
+  const SmSurface          * cpSurface     = pOriginalFace ? pOriginalFace->GetSurface() : NULL;
+  double                     dTol          = pPolyFace->GetTolerance();
+  SmVector3d                 sUp( 0,0,1 );
+
+  // convex corner test of PolyEdge lEdge->StartPt (its next PolyEdge is lNext) with CW neighbor lCW, as SmPolyEdge::IsConvexCorner()
+  auto IsConvexCorner = [&](ULONG lEdge, ULONG lNext, ULONG lCW, double & rdAngDeg, double & rdChordDist, double & rdAngDeg3d)
+    {
+      return SmPolyEdge::IsConvexCorner(sUp, sPoints[lEdge], sPoints[lNext], sPoints[lCW], sPoints[lEdge],
+                                        sVertices[lNext] == sVertices[lCW], cpSurface,
+                                        rdAngDeg, rdChordDist, rdAngDeg3d);
+    };
+
+  // split off the triangle [lStart->StartPt, lTriangle->StartPt, lEnd->StartPt], as MakeManifoldEdge(lStart, lEnd, ..., lTriangle)
+  auto Split = [&](ULONG lStart, ULONG lEnd, ULONG lTriangle)
+    {
+      rPlan.sSplits.push_back(lStart);
+      rPlan.sSplits.push_back(lEnd);
+      rPlan.sSplits.push_back(lTriangle);
+      sVertices.push_back(sVertices[lStart]); sPoints.push_back(sPoints[lStart]); // new PolyEdge  [lStart->StartPt, lEnd->StartPt]
+      sVertices.push_back(sVertices[lEnd]);   sPoints.push_back(sPoints[lEnd]);   // radial mate   [lEnd->StartPt, lStart->StartPt]
+      return (ULONG)(sVertices.size() - 2);
+    };
+
+  // case 2 - Four-sided convex polygon - split along shortest mid-edge
+  if (lNumLoopEdges == 4)
+    {
+      double dAngDeg = 0.0, dAngDeg3d = 0.0;
+      double dRatio = 0.0;
+      if (   IsConvexCorner(0, 1, 3, dAngDeg, dRatio, dAngDeg3d)
+          && IsConvexCorner(1, 2, 0, dAngDeg, dRatio, dAngDeg3d)
+          && IsConvexCorner(2, 3, 1, dAngDeg, dRatio, dAngDeg3d)
+          && IsConvexCorner(3, 0, 2, dAngDeg, dRatio, dAngDeg3d))
+        {
+          double dDist02 = sPoints[0].DistanceBetweenSquared( sPoints[2] );
+          double dDist13 = sPoints[1].DistanceBetweenSquared( sPoints[3] );
+          if ( dDist02 < dDist13 ) { Split(0, 2, 1); }
+          else                     { Split(1, 3, 2); }
+          rPlan.bValid = TRUE;
+          return TRUE;
+        }
+    }
+
+  // general case - split off the best scored corner triangle until a triangle remains
+  //   with the first TriangulateSingleFace() score parameters: only 2d, colinear corners not allowed.
+  //   (A best score of BAD_SCORE resets the scores with other parameters: TriangulateFace().)
+  rPlan.bVertexTree = TRUE;
+  const double dWt3d = 0.0;
+
+  std::vector<ULONG>  sFaceEdges(lNumLoopEdges);  // PolyEdge ids in PolyLoop order
+  std::vector<ULONG>  sScores(lNumLoopEdges, 0);
+  std::vector<double> sChordDist(lNumLoopEdges, 0.0);
+  for (ULONG ii = 0; ii < lNumLoopEdges; ii++)
+    { sFaceEdges[ii] = ii; }
+
+  while (TRUE)
+    {
+      ULONG lNumEdges = (ULONG)sFaceEdges.size();
+      if ( lNumEdges <= 3 )
+        { break; }
+
+      ULONG     lBestScoreEdge    = 0;
+      ULONG     lBestScore        = BAD_SCORE;
+      double    dBestChordDist    = SM_BIG_DOUBLE;
+      SmBoolean bInsideVertexEdge = FALSE;
+      SmBoolean bRescored         = FALSE;
+
+      // for every PolyEdge->StartPt - score neighbor PolyVertex pairs
+      for (ULONG ii = 0; ii < lNumEdges; ii++)
+        {
+          ULONG     lV0Edge                = sFaceEdges[ii];
+          SmBoolean bVertexClosestToV0VCCW = FALSE;
+
+          // when PolyFaceEdge->Start Neighbor Vertex pair has no Score
+          if (sScores[ii] == 0)
+            {
+              bRescored = TRUE;
+              ULONG lVCW_Edge  = sFaceEdges[((ii + lNumEdges) - 1) % lNumEdges];
+              ULONG lVCCW_Edge = sFaceEdges[(ii + 1) % lNumEdges];
+
+              ULONG  lScore = 0;
+              double dAngDeg2d = 0.0;
+              double dAngDeg3d = 0.0;
+              double dChordDistUV = 0.0;
+
+              // get dAngDeg2d and if it's not convex in 2d we want a bad score
+              if (!IsConvexCorner(lV0Edge, lVCCW_Edge, lVCW_Edge, dAngDeg2d, dChordDistUV, dAngDeg3d))
+                { lScore = BAD_SCORE; }
+
+              // Combine 2d and 3d angles according to dWt3d.
+              double dAngScore = (1.0 - dWt3d) * smos_Ceil(dAngDeg2d) + dWt3d * smos_Ceil(dAngDeg3d);
+              if (!(dAngScore >= 0.0 && dAngScore < 1.0e9))
+                { return FALSE; } // (not expected)
+              lScore += (ULONG)dAngScore;
+
+              // Subdivision produces higher score (less likely to be used)
+              ULONG lNumSubdivisionsNeeded;
+              if (SM_SUCCESS != cpTess->CheckAgainstSurfaceCache(pTessCache, sPoints[lVCCW_Edge], sPoints[lVCW_Edge],
+                                                                 1.1, TRUE, lNumSubdivisionsNeeded))
+                { return FALSE; }
+              if (lNumSubdivisionsNeeded > 0)
+                { lScore += lNumSubdivisionsNeeded * 1000; }
+
+              // When any vertices are inside proposed triangle: bad score.
+              if (SM_SUCCESS != sm_PlanHasInsideVertex(sPoints[lV0Edge], sPoints[lVCCW_Edge], sPoints[lVCW_Edge],
+                                                       dTol, sFaceEdges, sPoints, bVertexClosestToV0VCCW))
+                { return FALSE; }
+              if (bVertexClosestToV0VCCW)
+                { lScore = BAD_SCORE; }
+
+              sScores[ii]    = lScore;
+              sChordDist[ii] = dChordDistUV;
+            }
+
+          // Save best score - ties go to smallest UV space dBestChordDist.
+          if ((sScores[ii] < lBestScore) || (sScores[ii] == lBestScore && sChordDist[ii] < dBestChordDist))
+            {
+              lBestScore     = sScores[ii];
+              lBestScoreEdge = ii;
+              dBestChordDist = sChordDist[ii];
+              if (!bRescored)
+                {
+                  ULONG lVCW_Edge  = sFaceEdges[((ii + lNumEdges) - 1) % lNumEdges];
+                  ULONG lVCCW_Edge = sFaceEdges[(ii + 1) % lNumEdges];
+                  if (SM_SUCCESS != sm_PlanHasInsideVertex(sPoints[lV0Edge], sPoints[lVCCW_Edge], sPoints[lVCW_Edge],
+                                                           dTol, sFaceEdges, sPoints, bVertexClosestToV0VCCW))
+                    { return FALSE; }
+                }
+              bInsideVertexEdge = bVertexClosestToV0VCCW;
+            }
+        } // end iter ii, every PolyEdge->StartPt
+
+      // no good split (score reset, message) or a split to an inside vertex: TriangulateFace()
+      if (lBestScore >= BAD_SCORE || bInsideVertexEdge)
+        { return FALSE; }
+
+      // Add manifold PolyEdge pair between best corner's neighbor vertices
+      ULONG lBestEdge = sFaceEdges[lBestScoreEdge];
+      ULONG lVCWEdge  = sFaceEdges[((lBestScoreEdge+lNumEdges)-1)%lNumEdges];
+      ULONG lVCCWEdge = sFaceEdges[(lBestScoreEdge+1)%lNumEdges];
+      ULONG lNewEdge  = Split(lVCWEdge, lVCCWEdge, lBestEdge);
+
+      // clear scores for BestEdge and its neighbors, as TriangulateSingleFace()
+      sScores[(lBestScoreEdge) % lNumEdges] = 0;
+      sChordDist[(lBestScoreEdge) % lNumEdges] = 0.0;
+      sFaceEdges[(lBestScoreEdge) % lNumEdges] = lNewEdge;
+
+      sScores[(lBestScoreEdge+1) % lNumEdges] = 0;
+      sChordDist[(lBestScoreEdge+1) % lNumEdges] = 0.0;
+
+      sScores[((lBestScoreEdge + lNumEdges) - 2) % lNumEdges] = 0;
+      sChordDist[((lBestScoreEdge + lNumEdges) - 2) % lNumEdges] = 0.0;
+
+      // remove old cw edge, it is in the new triangle with the radial of the new edge and BestEdge
+      ULONG lRemove = ((lBestScoreEdge + lNumEdges) - 1) % lNumEdges;
+      sScores.erase(sScores.begin() + lRemove);
+      sChordDist.erase(sChordDist.begin() + lRemove);
+      sFaceEdges.erase(sFaceEdges.begin() + lRemove);
+    } // end while PolyFace has more than 3 PolyEdges
+
+  rPlan.bValid = TRUE;
+  return TRUE;
+
+} // end sm_PlanTriangulation
+
+/*******************************************************************//**
+PURPOSE: TRUE when pPolyFace still has the PolyLoop it was planned with.
+
+NOTES: A defensive check: TriangulateFace() only splits PolyEdges it creates,
+       so triangulating other PolyFaces doesn't edit this PolyLoop.
+***********************************************************************/
+static SmBoolean sm_IsPlanCurrent
+ (const SmPolyFace          * cpPolyFace,  // in : planned PolyFace
+  const SmTriangulationPlan & crPlan)      // in : its plan
+{
+  ULONG lNumEdges = (ULONG)crPlan.sPolyVertices.size();
+  if (cpPolyFace->GetSize() != 1 || lNumEdges == 0)
+    { return FALSE; }
+
+  const SmPolyLoop * cpPolyLoop = (const SmPolyLoop *)cpPolyFace->GetList();
+  const SmPolyEdge * cpPolyEdge = cpPolyLoop->GetFirstPolyEdge();
+  for (ULONG ii = 0; ii < lNumEdges; ii++, cpPolyEdge = cpPolyEdge->GetCCWPolyEdge())
+    {
+      SmPoint3d sPoint = cpPolyEdge->GetStartPoint();
+      if (   cpPolyEdge != crPlan.sPolyEdges[ii]
+          || cpPolyEdge->GetStartPolyVertex() != crPlan.sPolyVertices[ii]
+          || std::memcmp(&sPoint, &crPlan.sPoints[ii], sizeof(SmPoint3d)) != 0)
+        { return FALSE; }
+    }
+  return cpPolyEdge == crPlan.sPolyEdges[0];
+
+} // end sm_IsPlanCurrent
+
+/*******************************************************************//**
+PURPOSE: Triangulate a planned PolyFace: the TriangulateFace() edits.
+
+NOTES: The same marks and MakeManifoldEdge() calls as TriangulateFace().
+***********************************************************************/
+static SmStatus sm_TriangulatePlannedFace
+ (SmPolyFace          * pPolyFace,  // in : PolyFace to split into a family of triangle PolyFaces
+  SmTriangulationPlan & rPlan)      // in : its current plan
+{
+  // increment and lock an unlocked mark
+  SmNewMarkAndLock sMarkLock( pPolyFace->GetContext(), SM_MT_ALLMARKS) ;
+
+  // TriangulateSingleFace() increments the locked mark value for a new vertex tree
+  if (rPlan.bVertexTree)
+    { sMarkLock.NewMark(); }
+
+  // make the planned splits
+  std::vector<SmPolyEdge*> & sPolyEdges = rPlan.sPolyEdges;
+  for (size_t ii = 0; ii < rPlan.sSplits.size(); ii += 3)
+    {
+      SmPolyEdge * pStartEdge    = sPolyEdges[rPlan.sSplits[ii]];
+      SmPolyEdge * pEndEdge      = sPolyEdges[rPlan.sSplits[ii+1]];
+      SmPolyEdge * pTriangleEdge = sPolyEdges[rPlan.sSplits[ii+2]];
+
+      // TriangulateSingleFace() general case marks the best corner PolyEdge
+      if (rPlan.bVertexTree)
+        { pTriangleEdge->Mark(sMarkLock.GetMarkType()); }
+
+      SmPolyEdge   * pNewPolyEdge       = NULL ;
+      SmPolyLoop   * pNewPolyLoop       = NULL ;
+      SmPolyFace   * pNewPolyFace       = NULL ;
+      SmPolyEdge   * pNewSingularEdge   = NULL ;
+      SmPolyVertex * pNewSingularVertex = NULL ;
+      SER(pPolyFace->MakeManifoldEdge(pStartEdge, pEndEdge, pNewPolyEdge, pNewPolyLoop, pNewPolyFace,
+                                      FALSE, &pNewSingularEdge, &pNewSingularVertex, pTriangleEdge));
+      sPolyEdges.push_back(pNewPolyEdge);
+      sPolyEdges.push_back(pNewPolyEdge->GetRadial());
+    }
+
+  return SM_SUCCESS;
+
+} // end sm_TriangulatePlannedFace
+
+/*******************************************************************//**
+PURPOSE: TRUE when the triangulation of the PolyFaces of a face may be
+         planned.
+
+NOTES: Notify callbacks and attributes could react to the PolyBrep edits,
+       so plans need neither, as parallel surface refinement.
+       SMLIB_TESS_SERIAL_TRIANGULATION=1 turns plans off.
+***********************************************************************/
+static SmBoolean sm_CanPlanTriangulation
+ (const SmPolyBrep * cpPolyBrep,   // in : PolyBrep of the PolyFaces
+  const SmFace     * cpFace)       // in : their original face
+{
+  static const SmBoolean sbPlans = (getenv("SMLIB_TESS_SERIAL_TRIANGULATION") == NULL);
+  SmContext       * pContext  = cpPolyBrep ? (SmContext *)cpPolyBrep->GetContext() : NULL;
+  const SmSurface * cpSurface = cpFace ? cpFace->GetSurface() : NULL;
+  return(   sbPlans
+         && pContext  != NULL
+         && pContext->GetUserNotifyCallback() == NULL
+         && pContext->GetSysNotifyCallback()  == NULL
+         && !cpPolyBrep->HasAttributes()
+         && cpFace    != NULL
+         && !cpFace->HasAttributes()
+         && cpSurface != NULL
+         && !cpSurface->HasAttributes()) ;
+
+} // end sm_CanPlanTriangulation
+#endif // !SM_USE_TESS_DEGREE && !SM_USE_TESS_SPLITFACE
+
 /*******************************************************************//**
 PURPOSE: Triangulate 1 many sided pFace into many 3 sided PolyFaces by repeated subdivision.
 
@@ -5844,6 +6273,42 @@ std::atomic<ULONG> lDebugCount(0);
   pPolyBrep->GetPolyFaces( sPolyFaces );
   ULONG lNumFaces = sPolyFaces.GetSize();
 
+#if !defined(SM_USE_TESS_DEGREE) && !defined(SM_USE_TESS_SPLITFACE)
+  // Plan the triangulation of many BSpline surface PolyFaces on worker threads (see SmTriangulationPlan).
+  // Meanwhile the PolyBrep, the surface and its cache are only read: CheckAgainstSurfaceCache() needs
+  // the built cache tree, which GetTree() would otherwise build.
+  static constexpr ULONG slMinPlannedFaces = 64;
+  std::vector<SmTriangulationPlan> sPlans;
+  const SmSurface * cpSurface = pFace->GetSurface();
+  if (   !m_bAdvancingFront
+      && lNumFaces >= slMinPlannedFaces
+      && cpSurface
+      && cpSurface->GetType() == SmBSplineSurface_TYPE
+      && pSC->m_pTree != NULL
+      && pSC->m_bHaveTSurfaceCache
+      && sm_CanPlanTriangulation(pPolyBrep, pFace))
+    {
+      ((SmBSplineSurface *)cpSurface)->GetOrCreateGwNurbPointer();  // built before sharing the surface
+      sPlans.resize(lNumFaces);
+      sm_ParallelFor(tbb::blocked_range<ULONG>(0, lNumFaces, 16), [&](const tbb::blocked_range<ULONG> & crRange)
+        {
+          // neighbor PolyFaces share vertices: memoize their normals and 1st derivatives
+          SmSurfaceEvaluationMemo sEvaluationMemo(cpSurface);
+          for (ULONG ii = crRange.begin(); ii != crRange.end(); ++ii)
+            {
+              // PolyFaces of pFace with one closed outer PolyLoop
+              SmPolyFace * pPolyFace = sPolyFaces[ii];
+              SmPolyLoop * pPolyLoop = pPolyFace->GetSize() == 1 ? (SmPolyLoop *)pPolyFace->GetList() : NULL;
+              if (   pPolyLoop
+                  && pPolyLoop->m_eOrientation == SM_OT_SAME
+                  && (pPolyLoop->m_bClosed || pPolyLoop->m_pLastEndPolyVertex == NULL)
+                  && pPolyFace->GetOriginalFace() == pFace)
+                { sm_PlanTriangulation(this, pSC, pPolyFace, sPlans[ii]); }
+            }
+        });
+    }
+#endif // !SM_USE_TESS_DEGREE && !SM_USE_TESS_SPLITFACE
+
   // for every PolyFace - triangulate it
   for(ULONG ii=0;ii<lNumFaces;ii++)
     {
@@ -5857,6 +6322,13 @@ std::atomic<ULONG> lDebugCount(0);
                                      pSC->m_dMaximumSideLength3D,
                                      sNewPolyFaces );
         }
+#if !defined(SM_USE_TESS_DEGREE) && !defined(SM_USE_TESS_SPLITFACE)
+      else if (ii < sPlans.size() && sPlans[ii].bValid && sm_IsPlanCurrent(pPolyFace, sPlans[ii]))
+        {
+          // make the TriangulateFace() edits found by the plan
+          eStat = sm_TriangulatePlannedFace( pPolyFace, sPlans[ii] );
+        }
+#endif
       else // triangulate face without AdvancingFront (AF)
         {
           eStat = TriangulateFace( pPolyFace );

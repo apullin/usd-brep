@@ -757,6 +757,21 @@ public:
                                                   ///<      : used to skip over Degenerate PolyEdge neighborss NULL to ignore.                  <br>
   ) const;
 
+  // IsConvexCorner() of the corner at crStart between PolyEdge [crStart, crEnd] and its CW PolyEdge [crCWStart, crCWEnd]
+  static SmBoolean IsConvexCorner
+  (
+    const SmVector3d & crPolyNormal,              ///< [in] : NormalVec of PolyEdge->PolyLoop->PolyFace owner                                   <br>
+    const SmPoint3d  & crStart,                   ///< [in] : PolyEdge start point                                                              <br>
+    const SmPoint3d  & crEnd,                     ///< [in] : PolyEdge end point                                                                <br>
+    const SmPoint3d  & crCWStart,                 ///< [in] : CW PolyEdge start point                                                           <br>
+    const SmPoint3d  & crCWEnd,                   ///< [in] : CW PolyEdge end point                                                             <br>
+    SmBoolean          bStrut,                    ///< [in] : TRUE = PolyEdge end PolyVertex is the CW PolyEdge start PolyVertex                <br>
+    const SmSurface  * cpSurface,                 ///< [in] : PolyFace->OriginalFace->Surface when both PolyEdges share the PolyFace, else NULL <br>
+    double           & rdAngleDeg,                ///< [out]: as IsConvexCorner()                                                               <br>
+    double           & rdChordLength,             ///< [out]: as IsConvexCorner()                                                               <br>
+    double           & rdAngleDeg3d               ///< [out]: as IsConvexCorner()                                                               <br>
+  );
+
   SmBoolean Is3DConvexCorner     
   (
     double           & rdAngleDeg,                ///< [out]: inside angle of PEdge->Start corner in PEdge->PolyLoop                         <br>

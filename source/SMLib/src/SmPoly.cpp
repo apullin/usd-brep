@@ -20999,8 +20999,47 @@ SmBoolean SmPolyEdge::IsConvexCorner
 {
   // locals
   SmPolyEdge * pCW         = pOptCWPolyEdge ? pOptCWPolyEdge : GetCWPolyEdge();
-  SmVector3d   sVecThis    = GetEndPoint() - GetStartPoint();           // ThisVec pointing out from StartPoint
-  SmVector3d   sVecCW      = pCW->GetStartPoint() - pCW->GetEndPoint(); // CWVec   pointing out from StartPoint
+  SmPolyFace * pPolyFace   = this->GetPolyFace() ;
+  SmPolyFace * pCWPolyFace = pCW->GetPolyFace() ;
+  SmFace     * pFace       = pPolyFace ? pPolyFace->GetOriginalFace() : NULL ;
+  SmSurface  * pSurface    = pFace ? pFace->GetSurface() : NULL ;
+
+  // pass the call along - the 3space angle needs both PolyEdges in the same PolyFace
+  return IsConvexCorner(crPolyNormal,
+                        GetStartPoint(),
+                        GetEndPoint(),
+                        pCW->GetStartPoint(),
+                        pCW->GetEndPoint(),
+                        GetEndPolyVertex() == pCW->GetStartPolyVertex(),
+                        pPolyFace == pCWPolyFace ? pSurface : NULL,
+                        rdAngleDeg,
+                        rdChordDistance,
+                        rdAngleDeg3d);
+
+} // end SmPolyEdge::IsConvexCorner
+
+/*******************************************************************//**
+PURPOSE: SmPolyEdge::IsConvexCorner() for a corner given by its points.
+
+NOTES:  Pure geometry: safe to call while the PolyEdges are not edited.
+***********************************************************************/
+SmBoolean SmPolyEdge::IsConvexCorner    
+ (const SmVector3d & crPolyNormal,     // in : NormalVec of PolyEdge->PolyLoop->PolyFace owner
+  const SmPoint3d  & crStart,          // in : PolyEdge start point
+  const SmPoint3d  & crEnd,            // in : PolyEdge end point
+  const SmPoint3d  & crCWStart,        // in : CW PolyEdge start point
+  const SmPoint3d  & crCWEnd,          // in : CW PolyEdge end point
+  SmBoolean          bStrut,           // in : TRUE = PolyEdge end PolyVertex is the CW PolyEdge start PolyVertex
+  const SmSurface  * cpSurface,        // in : PolyFace->OriginalFace->Surface when both PolyEdges share the PolyFace, else NULL
+  double           & rdAngleDeg,       // out: inside AngleDeg at this vertex in PolyEdge->PolyLoop
+                                       //      normally in UV Space, but in 3D space when corner is on Surface Pole
+  double           & rdChordDistance,  // out: UVDist:[PrevVertPt, NextVertPt]  in PolyEdge->PolyLoop 
+  double           & rdAngleDeg3d)     // out: only used when cpSurface != NULL, corner angle in 3d space
+                                       //      otherwise set to 0.0
+{
+  // locals
+  SmVector3d   sVecThis    = crEnd - crStart;       // ThisVec pointing out from StartPoint
+  SmVector3d   sVecCW      = crCWStart - crCWEnd;   // CWVec   pointing out from StartPoint
   double       dAngleRad   = 0.0 ;
   double       dAngleRad3d = 0.0 ;
 
@@ -21008,7 +21047,7 @@ SmBoolean SmPolyEdge::IsConvexCorner
   rdChordDistance = sVecThis.DistanceBetween(sVecCW);
                                                   
   // Check for topological strut edge case. TopoNote:  <--CCW--+ <--this--+ <--CW--+   where + = PolyEdge->GetStartPolyVertrex()
-  if(GetEndPolyVertex() == pCW->GetStartPolyVertex()) 
+  if(bStrut) 
     {
       rdAngleDeg = 360.0;
       return FALSE;
@@ -21019,14 +21058,8 @@ SmBoolean SmPolyEdge::IsConvexCorner
   SE( sVecThis.Unitize() );
   SE( crPolyNormal.CCWAngleBetween( sVecThis, sVecCW, dAngleRad ) );
 
-  // locals
-  SmPolyFace * pPolyFace   = this->GetPolyFace() ;
-  SmPolyFace * pCWPolyFace = pCW->GetPolyFace() ;
-  SmFace     * pFace       = pPolyFace ? pPolyFace->GetOriginalFace() : NULL ;
-  SmSurface  * pSurface    = pFace ? pFace->GetSurface() : NULL ;
-
   // when PolyEdges come from same PolyFace with an OriginalFace->Surface - compute 3space angle 
-  if(pPolyFace == pCWPolyFace && pSurface)
+  if(cpSurface)
     {
       // UV locals
       SmPoint3d sStartPV[2], sCWEndPV[2], sNormal ;
@@ -21034,16 +21067,16 @@ SmBoolean SmPolyEdge::IsConvexCorner
       SmPoint2d sStartUV, sCWEndUV ;
 
       // UV corner positions and vecs
-      sStartUV    = GetStartPoint() ;
-      sCWEndUV    = pCW->GetEndPoint() ;
+      sStartUV    = crStart ;
+      sCWEndUV    = crCWEnd ;
       sStartVecUV = sVecThis ;
       sCWEndVecUV = sVecCW ;
       SmScaledZero sScaledZeroUV = 100.0 * SmTol::GetScaledZero(sStartUV);
 
       // 3d corner positions and vecs
-      SE(pSurface->EvaluateDirectionalDerivs(sStartUV, sStartVecUV, 1, sStartPV)) ;
-      SE(pSurface->EvaluateDirectionalDerivs(sCWEndUV, sCWEndVecUV, 1, sCWEndPV)) ;
-      SE(pSurface->EvaluateNormal(sStartUV, TRUE, TRUE, sNormal)) ;
+      SE(cpSurface->EvaluateDirectionalDerivs(sStartUV, sStartVecUV, 1, sStartPV)) ;
+      SE(cpSurface->EvaluateDirectionalDerivs(sCWEndUV, sCWEndVecUV, 1, sCWEndPV)) ;
+      SE(cpSurface->EvaluateNormal(sStartUV, TRUE, TRUE, sNormal)) ;
       SmScaledZero sScaledZero3D = 100.0 * SmTol::GetScaledZero(sStartPV[0]);
 
       // corner angle in 3d space 
