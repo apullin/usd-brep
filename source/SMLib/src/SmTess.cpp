@@ -34,6 +34,7 @@
 
 #include "tbb/parallel_for.h"
 #include <SmParallel.h>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -5327,7 +5328,8 @@ static void CreatePolygonsFromInsidePartsOfTree
 // Plans follow TriangulateSingleFace() without its SM_USE_TESS_DEGREE and SM_USE_TESS_SPLITFACE variants
 #if !defined(SM_USE_TESS_DEGREE) && !defined(SM_USE_TESS_SPLITFACE)
 /*******************************************************************//**
-   Triangulation plans for SmTess::AddQuadBoundaries().
+   Triangulation plans for SmTess::AddQuadBoundaries() and
+   SmTess::TriangulateSingleFace().
 
    TriangulateFace() of a PolyFace with one closed outer PolyLoop makes a
    single TriangulateSingleFace() call: a convex quad is split along its
@@ -5335,9 +5337,10 @@ static void CreatePolygonsFromInsidePartsOfTree
    per iteration until a triangle remains. The corner scores are pure
    geometry, so the corners of many PolyFaces are planned on worker threads
    first. The serial loop then makes the same Mark() and MakeManifoldEdge()
-   calls in place of TriangulateFace(). Cases the plans don't cover (inner
-   loops, corners without a usable score, inside vertices) and PolyFaces
-   edited since they were planned still run TriangulateFace().
+   calls in place of TriangulateFace(). TriangulateSingleFace() plans its
+   general case the same way, once inner loops are connected. Cases the
+   plans don't cover (corners without a usable score, inside vertices) and
+   PolyFaces edited since they were planned keep the original code.
 ***********************************************************************/
 namespace {
 
@@ -5351,6 +5354,75 @@ struct SmTriangulationPlan
   std::vector<SmPoint3d>     sPoints;              // their start points
   std::vector<ULONG>         sSplits;              // per MakeManifoldEdge(): start, end and triangle PolyEdge ids
                                                    //   ids: sPolyEdges index, then 2 per split for the new PolyEdge and its radial
+};
+
+// PolyEdge ids of a large planned PolyFace bucketed by start point UV, for inside point tests
+class SmPlanVertexGrid
+{
+public:
+  // FALSE when the points give no finite cells: then test every PolyFace PolyEdge
+  SmBoolean Build(const std::vector<SmPoint3d> & crPoints)
+  {
+    SmExtent2d sBox(SmPoint2d(crPoints[0].x, crPoints[0].y));
+    for (const SmPoint3d & crPoint : crPoints)
+      { sBox.AddPoint2d(SmPoint2d(crPoint.x, crPoint.y)); }
+    double dSizeX = sBox.GetMax().x - sBox.GetMin().x;
+    double dSizeY = sBox.GetMax().y - sBox.GetMin().y;
+    double dCell  = smos_Sqrt(dSizeX * dSizeY / (double)crPoints.size()) * 2.0;
+    m_lNumX = (dCell > 0.0 && dSizeX > 0.0) ? (ULONG)smos_Min(smos_Ceil(dSizeX / dCell), 1024.0) : 1;
+    m_lNumY = (dCell > 0.0 && dSizeY > 0.0) ? (ULONG)smos_Min(smos_Ceil(dSizeY / dCell), 1024.0) : 1;
+    m_dMinX = sBox.GetMin().x;
+    m_dMinY = sBox.GetMin().y;
+    m_dInvX = dSizeX > 0.0 ? m_lNumX / dSizeX : 0.0;
+    m_dInvY = dSizeY > 0.0 ? m_lNumY / dSizeY : 0.0;
+    if (!std::isfinite(m_dInvX) || !std::isfinite(m_dInvY))
+      { return FALSE; }
+    m_sCells.assign(m_lNumX * m_lNumY, std::vector<ULONG>());
+    m_sAlive.assign(crPoints.size(), 1);
+    for (ULONG ii = 0; ii < crPoints.size(); ii++)
+      { m_sCells[CellX(crPoints[ii].x) + m_lNumX * CellY(crPoints[ii].y)].push_back(ii); }
+    return TRUE;
+  }
+
+  // a PolyEdge joins or leaves the PolyFace
+  void Add(ULONG lId, const SmPoint3d & crPoint)
+  {
+    if (m_sAlive.size() <= lId)
+      { m_sAlive.resize(lId + 1, 0); }
+    m_sAlive[lId] = 1;
+    m_sCells[CellX(crPoint.x) + m_lNumX * CellY(crPoint.y)].push_back(lId);
+  }
+  void Remove(ULONG lId) { m_sAlive[lId] = 0; }
+
+  // the PolyFace PolyEdges in the cells meeting a finite box
+  const std::vector<ULONG> & GetIds(const SmExtent3d & crBox) const
+  {
+    m_sIds.clear();
+    for (ULONG lY = CellY(crBox.GetMin().y); lY <= CellY(crBox.GetMax().y); lY++)
+      {
+        for (ULONG lX = CellX(crBox.GetMin().x); lX <= CellX(crBox.GetMax().x); lX++)
+          {
+            for (ULONG lId : m_sCells[lX + m_lNumX * lY])
+              {
+                if (m_sAlive[lId])
+                  { m_sIds.push_back(lId); }
+              }
+          }
+      }
+    return m_sIds;
+  }
+
+private:
+  // cell indices, monotonic for finite coordinates: points inside a box have cells inside the box cells
+  //   (only finite values in [0, m_lNum - 1) are cast)
+  ULONG CellX(double dX) const { double d = smos_Floor((dX - m_dMinX) * m_dInvX); return d > 0.0 ? (d < m_lNumX - 1 ? (ULONG)d : m_lNumX - 1) : 0; }
+  ULONG CellY(double dY) const { double d = smos_Floor((dY - m_dMinY) * m_dInvY); return d > 0.0 ? (d < m_lNumY - 1 ? (ULONG)d : m_lNumY - 1) : 0; }
+
+  double                          m_dMinX = 0.0, m_dMinY = 0.0, m_dInvX = 0.0, m_dInvY = 0.0;
+  ULONG                           m_lNumX = 1, m_lNumY = 1;
+  std::vector<std::vector<ULONG>> m_sCells;
+  std::vector<unsigned char>      m_sAlive;
+  mutable std::vector<ULONG>      m_sIds;
 };
 
 } // end anonymous namespace
@@ -5369,6 +5441,7 @@ static SmStatus sm_PlanHasInsideVertex
   const SmPoint3d              & crP2,         // in : P2 of Tri[P0,P1,P2]
   double                         dTol,         // in : PolyFace tolerance
   const std::vector<ULONG>     & crFaceEdges,  // in : PolyFace PolyEdge ids
+  const SmPlanVertexGrid       * cpGrid,       // in : PolyFace PolyEdge ids by position, NULL to test all crFaceEdges
   const std::vector<SmPoint3d> & crPoints,     // in : start point of every PolyEdge id
   SmBoolean                    & rbInside)     // out: TRUE = a PolyFace PolyVertex is inside Tri[P0,P1,P2]
 {
@@ -5398,10 +5471,11 @@ static SmStatus sm_PlanHasInsideVertex
   SER(sCross.CCWAngleBetween(sP0P1,sP0P2,dTriAngRad1));
   SER(sCross.CCWAngleBetween(sP2P0,sP2P1,dTriAngRad2));
 
-  // for every PolyFace PolyEdge
-  for(ULONG ii=0;ii<crFaceEdges.size();ii++)
+  // for every PolyFace PolyEdge (near the triangle)
+  const std::vector<ULONG> & crTestEdges = cpGrid ? cpGrid->GetIds(sTriBBox) : crFaceEdges;
+  for(ULONG ii=0;ii<crTestEdges.size();ii++)
     {
-      const SmPoint3d & sPTest = crPoints[crFaceEdges[ii]] ;
+      const SmPoint3d & sPTest = crPoints[crTestEdges[ii]] ;
       if(!sTriBBox.ContainsPoint3d(sPTest))
         { continue; }
 
@@ -5440,21 +5514,24 @@ static SmStatus sm_PlanHasInsideVertex
 } // end sm_PlanHasInsideVertex
 
 /*******************************************************************//**
-PURPOSE: Plan TriangulateFace(pPolyFace) for a PolyFace with one closed,
+PURPOSE: Plan TriangulateFace(pPolyFace), or the rest of
+         TriangulateSingleFace(pPolyFace), for a PolyFace with one closed,
          outer PolyLoop.
 
-NOTES: Returns FALSE when TriangulateFace() must run. Pure: reads the
+NOTES: Returns FALSE when the original code must run. Pure: reads the
        PolyFace, its surface and the surface cache without editing them.
        Follows the TriangulateSingleFace() cases for a single PolyLoop.
 ***********************************************************************/
 static SmBoolean sm_PlanTriangulation
- (const SmTess        * cpTess,      // in : tessellator for CheckAgainstSurfaceCache()
-  SmTessSrfCache      * pTessCache,  // in : PolyFace->OriginalFace surface cache
-  SmPolyFace          * pPolyFace,   // in : PolyFace to plan
-  SmTriangulationPlan & rPlan)       // out: plan, when TRUE is returned
+ (const SmTess                  * cpTess,            // in : tessellator for CheckAgainstSurfaceCache()
+  SmTessSrfCache                * pTessCache,        // in : PolyFace->OriginalFace surface cache
+  SmPolyFace                    * pPolyFace,         // in : PolyFace to plan
+  const SmTArray<SmPolyVertex*> * cpSingleVertices,  // in : PolyVertices of former single vertex PolyLoops, NULL for none
+  SmTriangulationPlan           & rPlan)             // out: plan, when TRUE is returned
 {
   constexpr ULONG BAD_SCORE = 999999;  // as TriangulateSingleFace()
-  constexpr ULONG lMaxEdges = 256;     // larger PolyFaces use TriangulateFace() and its vertex tree
+  constexpr ULONG lMaxEdges = 65536;   // larger PolyFaces use the original code
+  constexpr ULONG lMinGrid  = 64;      // PolyFaces with more PolyEdges find inside points with a grid
 
   // PolyLoop PolyEdges, their start PolyVertices and points
   SM_PTR_ARRAY(sLoopEdges, SmPolyEdge, 64) ;
@@ -5467,7 +5544,7 @@ static SmBoolean sm_PlanTriangulation
   rPlan.sPoints.resize(lNumLoopEdges);
   for (ULONG ii = 0; ii < lNumLoopEdges; ii++)
     {
-      // expect PolyEdge end = next PolyEdge start, no single vertex loops
+      // expect PolyEdge end = next PolyEdge start, no single vertex loops, finite points
       SmPolyEdge   * pPolyEdge = sLoopEdges[ii];
       SmPolyVertex * pVertex   = pPolyEdge->GetStartPolyVertex();
       if (   pVertex == NULL
@@ -5476,6 +5553,10 @@ static SmBoolean sm_PlanTriangulation
         { return FALSE; }
       rPlan.sPolyVertices[ii] = pVertex;
       rPlan.sPoints[ii]       = pVertex->GetPoint();
+      if (!(   smos_Fabs(rPlan.sPoints[ii].x) < SM_BIG_DOUBLE
+            && smos_Fabs(rPlan.sPoints[ii].y) < SM_BIG_DOUBLE
+            && smos_Fabs(rPlan.sPoints[ii].z) < SM_BIG_DOUBLE))
+        { return FALSE; }
     }
 
   // case 1 - triangle or degenerate polygon - no work
@@ -5543,6 +5624,12 @@ static SmBoolean sm_PlanTriangulation
   for (ULONG ii = 0; ii < lNumLoopEdges; ii++)
     { sFaceEdges[ii] = ii; }
 
+  // large PolyFaces find inside points with a grid, which needs finite triangle boxes
+  SmPlanVertexGrid   sGrid;
+  SmPlanVertexGrid * pGrid =    lNumLoopEdges > lMinGrid
+                             && smos_Fabs(dTol * 10.0) < SM_BIG_DOUBLE
+                             && sGrid.Build(sPoints) ? &sGrid : NULL;
+
   while (TRUE)
     {
       ULONG lNumEdges = (ULONG)sFaceEdges.size();
@@ -5577,6 +5664,10 @@ static SmBoolean sm_PlanTriangulation
               if (!IsConvexCorner(lV0Edge, lVCCW_Edge, lVCW_Edge, dAngDeg2d, dChordDistUV, dAngDeg3d))
                 { lScore = BAD_SCORE; }
 
+              // when current corner was a SingleLoopV before being connected into the loop system
+              if (cpSingleVertices && cpSingleVertices->IsIn(sVertices[lV0Edge]))
+                { dAngDeg2d += 360.0; }
+
               // Combine 2d and 3d angles according to dWt3d.
               double dAngScore = (1.0 - dWt3d) * smos_Ceil(dAngDeg2d) + dWt3d * smos_Ceil(dAngDeg3d);
               if (!(dAngScore >= 0.0 && dAngScore < 1.0e9))
@@ -5593,7 +5684,7 @@ static SmBoolean sm_PlanTriangulation
 
               // When any vertices are inside proposed triangle: bad score.
               if (SM_SUCCESS != sm_PlanHasInsideVertex(sPoints[lV0Edge], sPoints[lVCCW_Edge], sPoints[lVCW_Edge],
-                                                       dTol, sFaceEdges, sPoints, bVertexClosestToV0VCCW))
+                                                       dTol, sFaceEdges, pGrid, sPoints, bVertexClosestToV0VCCW))
                 { return FALSE; }
               if (bVertexClosestToV0VCCW)
                 { lScore = BAD_SCORE; }
@@ -5613,7 +5704,7 @@ static SmBoolean sm_PlanTriangulation
                   ULONG lVCW_Edge  = sFaceEdges[((ii + lNumEdges) - 1) % lNumEdges];
                   ULONG lVCCW_Edge = sFaceEdges[(ii + 1) % lNumEdges];
                   if (SM_SUCCESS != sm_PlanHasInsideVertex(sPoints[lV0Edge], sPoints[lVCCW_Edge], sPoints[lVCW_Edge],
-                                                           dTol, sFaceEdges, sPoints, bVertexClosestToV0VCCW))
+                                                           dTol, sFaceEdges, pGrid, sPoints, bVertexClosestToV0VCCW))
                     { return FALSE; }
                 }
               bInsideVertexEdge = bVertexClosestToV0VCCW;
@@ -5629,6 +5720,12 @@ static SmBoolean sm_PlanTriangulation
       ULONG lVCWEdge  = sFaceEdges[((lBestScoreEdge+lNumEdges)-1)%lNumEdges];
       ULONG lVCCWEdge = sFaceEdges[(lBestScoreEdge+1)%lNumEdges];
       ULONG lNewEdge  = Split(lVCWEdge, lVCCWEdge, lBestEdge);
+      if (pGrid)
+        {
+          pGrid->Remove(lVCWEdge);
+          pGrid->Remove(lBestEdge);
+          pGrid->Add(lNewEdge, sPoints[lNewEdge]);
+        }
 
       // clear scores for BestEdge and its neighbors, as TriangulateSingleFace()
       sScores[(lBestScoreEdge) % lNumEdges] = 0;
@@ -5682,20 +5779,19 @@ static SmBoolean sm_IsPlanCurrent
 } // end sm_IsPlanCurrent
 
 /*******************************************************************//**
-PURPOSE: Triangulate a planned PolyFace: the TriangulateFace() edits.
+PURPOSE: Make the planned splits of a PolyFace: the TriangulateSingleFace()
+         edits.
 
-NOTES: The same marks and MakeManifoldEdge() calls as TriangulateFace().
+NOTES: The same marks and MakeManifoldEdge() calls as TriangulateSingleFace().
 ***********************************************************************/
-static SmStatus sm_TriangulatePlannedFace
+static SmStatus sm_MakePlannedSplits
  (SmPolyFace          * pPolyFace,  // in : PolyFace to split into a family of triangle PolyFaces
-  SmTriangulationPlan & rPlan)      // in : its current plan
+  SmTriangulationPlan & rPlan,      // in : its current plan
+  SmNewMarkAndLock    & rMarkLock)  // in : TriangulateFace() mark
 {
-  // increment and lock an unlocked mark
-  SmNewMarkAndLock sMarkLock( pPolyFace->GetContext(), SM_MT_ALLMARKS) ;
-
   // TriangulateSingleFace() increments the locked mark value for a new vertex tree
   if (rPlan.bVertexTree)
-    { sMarkLock.NewMark(); }
+    { rMarkLock.NewMark(); }
 
   // make the planned splits
   std::vector<SmPolyEdge*> & sPolyEdges = rPlan.sPolyEdges;
@@ -5707,7 +5803,7 @@ static SmStatus sm_TriangulatePlannedFace
 
       // TriangulateSingleFace() general case marks the best corner PolyEdge
       if (rPlan.bVertexTree)
-        { pTriangleEdge->Mark(sMarkLock.GetMarkType()); }
+        { pTriangleEdge->Mark(rMarkLock.GetMarkType()); }
 
       SmPolyEdge   * pNewPolyEdge       = NULL ;
       SmPolyLoop   * pNewPolyLoop       = NULL ;
@@ -5721,6 +5817,21 @@ static SmStatus sm_TriangulatePlannedFace
     }
 
   return SM_SUCCESS;
+
+} // end sm_MakePlannedSplits
+
+/*******************************************************************//**
+PURPOSE: Triangulate a planned PolyFace: the TriangulateFace() edits.
+
+NOTES: The same marks and MakeManifoldEdge() calls as TriangulateFace().
+***********************************************************************/
+static SmStatus sm_TriangulatePlannedFace
+ (SmPolyFace          * pPolyFace,  // in : PolyFace to split into a family of triangle PolyFaces
+  SmTriangulationPlan & rPlan)      // in : its current plan
+{
+  // increment and lock an unlocked mark, as TriangulateFace()
+  SmNewMarkAndLock sMarkLock( pPolyFace->GetContext(), SM_MT_ALLMARKS) ;
+  return sm_MakePlannedSplits(pPolyFace, rPlan, sMarkLock);
 
 } // end sm_TriangulatePlannedFace
 
@@ -6303,7 +6414,7 @@ std::atomic<ULONG> lDebugCount(0);
                   && pPolyLoop->m_eOrientation == SM_OT_SAME
                   && (pPolyLoop->m_bClosed || pPolyLoop->m_pLastEndPolyVertex == NULL)
                   && pPolyFace->GetOriginalFace() == pFace)
-                { sm_PlanTriangulation(this, pSC, pPolyFace, sPlans[ii]); }
+                { sm_PlanTriangulation(this, pSC, pPolyFace, NULL, sPlans[ii]); }
             }
         });
     }
@@ -9570,6 +9681,20 @@ SmStatus SmTess::TriangulateSingleFace
   }
   // END JLMCC EDIT.
   #endif
+
+#if !defined(SM_USE_TESS_DEGREE) && !defined(SM_USE_TESS_SPLITFACE)
+  // When this PolyFace starts a vertex tree, plan its splits apart from the PolyBrep (see SmTriangulationPlan)
+  if ( !rpVertexTree && sm_CanPlanTriangulation(pPolyFace->GetPolyBrep(), pOriginalFace) )
+    {
+      SmPolyLoop * pPolyLoop = pPolyFace->GetSize() == 1 ? (SmPolyLoop *)pPolyFace->GetList() : NULL;
+      SmTriangulationPlan sPlan;
+      if (   pPolyLoop
+          && pPolyLoop->m_eOrientation == SM_OT_SAME
+          && (pPolyLoop->m_bClosed || pPolyLoop->m_pLastEndPolyVertex == NULL)
+          && sm_PlanTriangulation(this, pTessCache, pPolyFace, &sSingleVertices, sPlan))
+        { return sm_MakePlannedSplits(pPolyFace, sPlan, rMarkLock); }
+    }
+#endif // !SM_USE_TESS_DEGREE && !SM_USE_TESS_SPLITFACE
 
   // upcoming - split general polygon into a set of triangles
   // next     - but first build a Spatial Tree of all PolyFace Vertices.  Tree will
