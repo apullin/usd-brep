@@ -34,6 +34,7 @@
 
 #include "tbb/parallel_for.h"
 #include <SmParallel.h>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -5427,6 +5428,8 @@ private:
 
 } // end anonymous namespace
 
+static SmBoolean IsCollinear (double angleDeg);
+
 /*******************************************************************//**
 PURPOSE: FindInsideVertices() for a corner of a planned PolyFace.
 
@@ -5521,12 +5524,16 @@ PURPOSE: Plan TriangulateFace(pPolyFace), or the rest of
 NOTES: Returns FALSE when the original code must run. Pure: reads the
        PolyFace, its surface and the surface cache without editing them.
        Follows the TriangulateSingleFace() cases for a single PolyLoop.
+       With pMessages it also follows the resets of corner scores that
+       TriangulateSingleFace() reports when no corner has a usable score.
 ***********************************************************************/
 static SmBoolean sm_PlanTriangulation
  (const SmTess                  * cpTess,            // in : tessellator for CheckAgainstSurfaceCache()
   SmTessSrfCache                * pTessCache,        // in : PolyFace->OriginalFace surface cache
   SmPolyFace                    * pPolyFace,         // in : PolyFace to plan
   const SmTArray<SmPolyVertex*> * cpSingleVertices,  // in : PolyVertices of former single vertex PolyLoops, NULL for none
+  std::vector<ULONG>            * pMessages,         // out: the number of splits before each score reset message,
+                                                     //      NULL = return FALSE instead of planning score resets
   SmTriangulationPlan           & rPlan)             // out: plan, when TRUE is returned
 {
   constexpr ULONG BAD_SCORE = 999999;  // as TriangulateSingleFace()
@@ -5613,10 +5620,10 @@ static SmBoolean sm_PlanTriangulation
     }
 
   // general case - split off the best scored corner triangle until a triangle remains
-  //   with the first TriangulateSingleFace() score parameters: only 2d, colinear corners not allowed.
-  //   (A best score of BAD_SCORE resets the scores with other parameters: TriangulateFace().)
+  //   with the TriangulateSingleFace() score parameters: only 2d, at first colinear corners not allowed
   rPlan.bVertexTree = TRUE;
-  const double dWt3d = 0.0;
+  const double dWt3d          = 0.0;
+  SmBoolean    bAllowColinear = FALSE;
 
   std::vector<ULONG>  sFaceEdges(lNumLoopEdges);  // PolyEdge ids in PolyLoop order
   std::vector<ULONG>  sScores(lNumLoopEdges, 0);
@@ -5662,7 +5669,10 @@ static SmBoolean sm_PlanTriangulation
 
               // get dAngDeg2d and if it's not convex in 2d we want a bad score
               if (!IsConvexCorner(lV0Edge, lVCCW_Edge, lVCW_Edge, dAngDeg2d, dChordDistUV, dAngDeg3d))
-                { lScore = BAD_SCORE; }
+                {
+                  if (!bAllowColinear || !IsCollinear(dAngDeg2d))
+                    { lScore = BAD_SCORE; }
+                }
 
               // when current corner was a SingleLoopV before being connected into the loop system
               if (cpSingleVertices && cpSingleVertices->IsIn(sVertices[lV0Edge]))
@@ -5711,8 +5721,22 @@ static SmBoolean sm_PlanTriangulation
             }
         } // end iter ii, every PolyEdge->StartPt
 
-      // no good split (score reset, message) or a split to an inside vertex: TriangulateFace()
-      if (lBestScore >= BAD_SCORE || bInsideVertexEdge)
+      // no good split - TriangulateSingleFace() reports it, then resets the scores to allow colinear
+      // corners or quits when they were allowed
+      if (lBestScore >= BAD_SCORE)
+        {
+          if (pMessages == NULL)
+            { return FALSE; }
+          pMessages->push_back((ULONG)(rPlan.sSplits.size() / 3));
+          if (bAllowColinear)
+            { break; }
+          bAllowColinear = TRUE;
+          std::fill(sScores.begin(), sScores.end(), 0);
+          continue;
+        }
+
+      // a split to an inside vertex: original code
+      if (bInsideVertexEdge)
         { return FALSE; }
 
       // Add manifold PolyEdge pair between best corner's neighbor vertices
@@ -5779,23 +5803,36 @@ static SmBoolean sm_IsPlanCurrent
 } // end sm_IsPlanCurrent
 
 /*******************************************************************//**
-PURPOSE: Make the planned splits of a PolyFace: the TriangulateSingleFace()
-         edits.
+PURPOSE: Start making the planned splits of a PolyFace.
+
+NOTES: Sets the mark a new TriangulateSingleFace() vertex tree would set.
+***********************************************************************/
+static void sm_BeginPlannedSplits
+ (const SmTriangulationPlan & crPlan,      // in : current plan
+  SmNewMarkAndLock          & rMarkLock)   // in : TriangulateFace() mark
+{
+  // TriangulateSingleFace() increments the locked mark value for a new vertex tree
+  if (crPlan.bVertexTree)
+    { rMarkLock.NewMark(); }
+
+} // end sm_BeginPlannedSplits
+
+/*******************************************************************//**
+PURPOSE: Make planned splits [lFrom, lTo) of a PolyFace after
+         sm_BeginPlannedSplits(): the TriangulateSingleFace() edits.
 
 NOTES: The same marks and MakeManifoldEdge() calls as TriangulateSingleFace().
 ***********************************************************************/
 static SmStatus sm_MakePlannedSplits
  (SmPolyFace          * pPolyFace,  // in : PolyFace to split into a family of triangle PolyFaces
   SmTriangulationPlan & rPlan,      // in : its current plan
-  SmNewMarkAndLock    & rMarkLock)  // in : TriangulateFace() mark
+  SmNewMarkAndLock    & rMarkLock,  // in : TriangulateFace() mark
+  ULONG                 lFrom,      // in : first split
+  ULONG                 lTo)        // in : end of splits
 {
-  // TriangulateSingleFace() increments the locked mark value for a new vertex tree
-  if (rPlan.bVertexTree)
-    { rMarkLock.NewMark(); }
-
   // make the planned splits
   std::vector<SmPolyEdge*> & sPolyEdges = rPlan.sPolyEdges;
-  for (size_t ii = 0; ii < rPlan.sSplits.size(); ii += 3)
+  for (size_t ii = 3 * (size_t)lFrom; ii < 3 * (size_t)lTo; ii += 3)
     {
       SmPolyEdge * pStartEdge    = sPolyEdges[rPlan.sSplits[ii]];
       SmPolyEdge * pEndEdge      = sPolyEdges[rPlan.sSplits[ii+1]];
@@ -5831,7 +5868,8 @@ static SmStatus sm_TriangulatePlannedFace
 {
   // increment and lock an unlocked mark, as TriangulateFace()
   SmNewMarkAndLock sMarkLock( pPolyFace->GetContext(), SM_MT_ALLMARKS) ;
-  return sm_MakePlannedSplits(pPolyFace, rPlan, sMarkLock);
+  sm_BeginPlannedSplits(rPlan, sMarkLock);
+  return sm_MakePlannedSplits(pPolyFace, rPlan, sMarkLock, 0, (ULONG)(rPlan.sSplits.size() / 3));
 
 } // end sm_TriangulatePlannedFace
 
@@ -6414,7 +6452,7 @@ std::atomic<ULONG> lDebugCount(0);
                   && pPolyLoop->m_eOrientation == SM_OT_SAME
                   && (pPolyLoop->m_bClosed || pPolyLoop->m_pLastEndPolyVertex == NULL)
                   && pPolyFace->GetOriginalFace() == pFace)
-                { sm_PlanTriangulation(this, pSC, pPolyFace, NULL, sPlans[ii]); }
+                { sm_PlanTriangulation(this, pSC, pPolyFace, NULL, NULL, sPlans[ii]); }
             }
         });
     }
@@ -9688,11 +9726,23 @@ SmStatus SmTess::TriangulateSingleFace
     {
       SmPolyLoop * pPolyLoop = pPolyFace->GetSize() == 1 ? (SmPolyLoop *)pPolyFace->GetList() : NULL;
       SmTriangulationPlan sPlan;
+      std::vector<ULONG>  sMessages;
       if (   pPolyLoop
           && pPolyLoop->m_eOrientation == SM_OT_SAME
           && (pPolyLoop->m_bClosed || pPolyLoop->m_pLastEndPolyVertex == NULL)
-          && sm_PlanTriangulation(this, pTessCache, pPolyFace, &sSingleVertices, sPlan))
-        { return sm_MakePlannedSplits(pPolyFace, sPlan, rMarkLock); }
+          && sm_PlanTriangulation(this, pTessCache, pPolyFace, &sSingleVertices, &sMessages, sPlan))
+        {
+          // make the planned splits, reporting score resets as below
+          ULONG lSplit = 0;
+          sm_BeginPlannedSplits(sPlan, rMarkLock);
+          for (ULONG lMessage : sMessages)
+            {
+              SER(sm_MakePlannedSplits(pPolyFace, sPlan, rMarkLock, lSplit, lMessage));
+              MSG(_T("TriangulateFace: no good polygon split, all corners are !convex or contain OtherVerts, or SplitEdge needs at least 1000 subdivisions. A problem."));
+              lSplit = lMessage;
+            }
+          return sm_MakePlannedSplits(pPolyFace, sPlan, rMarkLock, lSplit, (ULONG)(sPlan.sSplits.size() / 3));
+        }
     }
 #endif // !SM_USE_TESS_DEGREE && !SM_USE_TESS_SPLITFACE
 
