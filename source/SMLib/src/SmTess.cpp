@@ -7217,6 +7217,19 @@ SmStatus SmTess::OutputToPolyBrep
   ULONG lNumAllVerts = sFPB_PolyVertices.GetSize();
   ULONG lNumFaces    = sFPB_PolyFaces.GetSize();
 
+  // For large faces, page in the m_p3DPolyBrep memory for the new PolyVertices, and for the PolyFaces,
+  // PolyLoops and PolyEdges of triangles, on worker threads as the loops below allocate it; they would
+  // otherwise fault in the fresh memory one page at a time.
+  static constexpr ULONG slMinParallelFaces = 1024;
+  std::size_t lPageInBytes = 0;
+  if (lNumFaces >= slMinParallelFaces)
+    {
+      lPageInBytes =   (std::size_t)lNumAllVerts * sizeof(SmPolyVertex)
+                     + (std::size_t)lNumFaces * (sizeof(SmPolyFace) + sizeof(SmPolyLoop) + 3 * sizeof(SmPolyEdge))
+                     + (std::size_t)(ppOptPolyShell ? 1 : lNumFaces) * (sizeof(SmPolyShell) + sizeof(SmPolyRegion));
+    }
+  SmArenaPageIn sPageIn(m_p3DPolyBrep->m_sMgr, lPageInBytes);
+
   // for every FacePolyBrep PolyVertex - create(sets OrigVertex) or get a PolyVertex in m_p3DPolyBrep and an associated SmPolyVertAuxData
   for(ii=0; ii<lNumAllVerts; ii++)
     {
@@ -7269,7 +7282,6 @@ SmStatus SmTess::OutputToPolyBrep
 
   // Gather the triangles of large FacePolyBreps on worker threads. A gathered triangle gets its
   // GetNormal3d() result here, with the same PolyFace side effects; others take the general path below.
-  static constexpr ULONG slMinParallelFaces = 1024;
   std::vector<SmOutputTriangle> sTriangles;
   if (lNumFaces >= slMinParallelFaces)
     {

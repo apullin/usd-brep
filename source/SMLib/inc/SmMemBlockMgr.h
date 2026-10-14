@@ -439,6 +439,8 @@ inline ULONG SmMemBlockMgr::GetMemoryUsed    // rtn: smaller size of actually us
  ***********************************************************************/
 class SM_EXPORT SmArenaMemBlockMgr
 {
+  friend class SmArenaPageIn;
+
  private:
   std::size_t m_initialBlockSize;  // initial size in bytes to allocate
   std::size_t m_lastBlockSize;     // size in bytes of the previously allocated block
@@ -461,6 +463,37 @@ class SM_EXPORT SmArenaMemBlockMgr
   std::size_t Size() const;
 
   void Reset();
+};
+
+/*******************************************************************//**
+PURPOSE: While in scope, pages in up to lBytes of the memory that an
+   SmArenaMemBlockMgr hands out next on this thread, on worker threads:
+   the rest of its current block right away, and each new block as
+   Reserve() allocates it.
+
+NOTES: Only writes zeros into arena memory that has not been handed out,
+   so the arena's contents and block sizes stay the same, and throws
+   nothing. For code about to fill a lot of fresh arena memory, which would
+   otherwise take one page fault per page on the calling thread.
+***********************************************************************/
+class SM_EXPORT SmArenaPageIn
+{
+ public:
+  SmArenaPageIn(SmArenaMemBlockMgr & rArena, std::size_t lBytes);
+  ~SmArenaPageIn();
+
+  SmArenaPageIn(const SmArenaPageIn &) = delete;
+  SmArenaPageIn & operator=(const SmArenaPageIn &) = delete;
+
+  // SmArenaMemBlockMgr::Reserve() hook: page in its new block when an SmArenaPageIn for it is in scope
+  static void NewBlock(const SmArenaMemBlockMgr * cpArena);
+
+ private:
+  void PageIn(char * pStart, std::size_t lSize);  // page in the first lSize bytes at pStart within the budget
+
+  const SmArenaMemBlockMgr * m_cpArena;     // arena being paged in
+  std::size_t                m_lBytesLeft;  // budget left
+  SmArenaPageIn            * m_pPrevious;   // SmArenaPageIn in scope before this one on this thread
 };
 
 #endif // !__SMMEMBLOCKMGR_H__
