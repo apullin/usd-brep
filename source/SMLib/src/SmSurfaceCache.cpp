@@ -5046,9 +5046,10 @@ SmStatus SmSurfaceCache::SubdivideToTolerancesParallel
       sAux.m_bAngleTolSatisfied    = pSpec->bAngleIn;
 
       SmBoolean bSetFast = FALSE;
-      t_pFastSubdivisionSink = &bSetFast;
-      pSpec->eTestStatus = pCache->TestAgainstTolerances(&sNode, pSpec->bNeedsSub, pSpec->eDir);
-      t_pFastSubdivisionSink = NULL;
+      {
+        SmTemporaryChangeValue<SmBoolean *> sSink(t_pFastSubdivisionSink, &bSetFast);
+        pSpec->eTestStatus = pCache->TestAgainstTolerances(&sNode, pSpec->bNeedsSub, pSpec->eDir);
+      }
 
       pSpec->bSetFast  = bSetFast;
       pSpec->bChordOut = sAux.m_bChordHeightSatisfied;
@@ -5198,9 +5199,8 @@ SmStatus SmSurfaceCache::SubdivideToTolerancesParallel
   // serial recursion with lookups
   SmRefinePrecompute sPrecompute;
   sPrecompute.sNodeSpecs[pTopNode] = pRoot.get();
-  t_pRefinePrecompute = &sPrecompute;
+  SmTemporaryChangeValue<SmRefinePrecompute *> sActive(t_pRefinePrecompute, &sPrecompute);
   SmStatus eStat = SubdivideToTolerances(pTree, pTopNode, NULL);
-  t_pRefinePrecompute = NULL;
 
   // unadopted child surfaces are deleted with pRoot
   return eStat;
