@@ -43,6 +43,8 @@
 #include <SmHealData.h>
 #include <SmOffsetSurface.h>
 #include <SmCopyBrepMap.h>
+#include <SmNurbsCrv.h>
+#include <nurbs.h>
 #include <SmTopologySolver.h>
 #include <SmShape.h>
 #include <SmSurfOfRevolution.h>
@@ -19231,6 +19233,64 @@ static SmStatus sm_AddAttributes
 } // end sm_AddAttributes
 
 /*******************************************************************//**
+PURPOSE: Make pGeom, a surface or curve owned by an SmBrepData, equal to the
+         copy MakeTopologyFromData would make of it, so that the Brep can
+         use pGeom itself.
+
+NOTES: Returns FALSE, changing nothing, unless that copy is a clone of pGeom
+       but for fixed up knots: pGeom is an SmBSplineSurface, SmPlane,
+       SmBSplineCurve or SmLine (not a derived type) of cpContext with its
+       own Nurb, no owner, attributes or cache, and the default point solver
+       flag. Then fixes up its knots as the copy constructors do.
+***********************************************************************/
+static SmBoolean sm_MakeGeometryAsItsCopy
+(
+  SmAObject       * pGeom,      // i/o: SmBrepData surface or curve
+  const SmContext * cpContext   // in : Brep context
+)
+{
+  if (   pGeom->HasAttributes()
+      || pGeom->GetCacheObj() != NULL
+      || pGeom->GetContext()  != cpContext)
+    { return FALSE; }
+
+  SM_TYPE tType = pGeom->GetType();
+  if (tType == SmBSplineSurface_TYPE || tType == SmPlane_TYPE)
+    {
+      SmBSplineSurface *pSurface = (SmBSplineSurface *)pGeom;
+      if (   pSurface->GetOwner() != NULL
+          || pSurface->IsNurbBorrowed() != FALSE
+          || pSurface->m_bUseNewPointSolvers != TRUE)  // SmSurface copy constructor value
+        { return FALSE; }
+
+      // as SmBSplineSurface's copy constructor
+      gw_SURFACE *pNurb = pSurface->GetOrCreateGwNurbPointer();
+      if (pNurb == NULL)
+        { return FALSE; }
+      sm_FixupKnotVector(pNurb->knu, SM_EFF_ZERO_PARAM);
+      sm_FixupKnotVector(pNurb->knv, SM_EFF_ZERO_PARAM);
+      return TRUE;
+    }
+
+  if (tType == SmBSplineCurve_TYPE || tType == SmLine_TYPE)
+    {
+      SmBSplineCurve *pCurve = (SmBSplineCurve *)pGeom;
+      if (   pCurve->GetOwner() != NULL
+          || pCurve->IsNurbBorrowed() != FALSE)
+        { return FALSE; }
+
+      // as SmBSplineCurve's copy constructor
+      gw_CURVE *pNurb = pCurve->GetGwNurbPointer();
+      if (pNurb != NULL)
+        { sm_FixupKnotVector(pNurb->knt, SM_EFF_ZERO); }
+      return TRUE;
+    }
+
+  return FALSE;
+
+} // end sm_MakeGeometryAsItsCopy
+
+/*******************************************************************//**
 PURPOSE: Delete topology that has not yet been linked into the Brep when
          MakeTopologyFromData exits early.
 
@@ -19297,6 +19357,30 @@ SmStatus SmBrep::MakeTopologyFromData
   SmBoolean                bAlwaysHeal,       // in : default FALSE: run healer on all read in BrepFiles
                                               //      a flag for internal development
   SmBoolean                bHealerIsEnabled)  // in : default TRUE: healer is enabled  FALSE: disable healer is any case
+{
+  return MakeTopologyFromData(pBrepData, rAllAttributes, bMakeUVTrimCurves, bAddAnalytics, bForceSameTol,
+                              bCheckUVCurves, bAlwaysHeal, bHealerIsEnabled, FALSE);
+
+} // end SmBrep::MakeTopologyFromData
+
+/*******************************************************************//**
+PURPOSE: MakeTopologyFromData() above, using pBrepData's surfaces and curves
+    instead of copies of them when bTakeGeometry is TRUE and a copy would be
+    a clone: those leave pBrepData, which is only good for deleting then.
+
+NOTES: See sm_MakeGeometryAsItsCopy(). Only geometry used once is taken.
+***********************************************************************/
+SmStatus SmBrep::MakeTopologyFromData
+(
+  SmBrepData             * pBrepData,         // i/o: target BrepData object
+  SmTArray<SmAttribute*> & rAllAttributes,    // in : as MakeTopologyFromData() above
+  SmBoolean                bMakeUVTrimCurves, // in : as MakeTopologyFromData() above
+  SmBoolean                bAddAnalytics,     // in : as MakeTopologyFromData() above
+  SmBoolean                bForceSameTol,     // in : as MakeTopologyFromData() above
+  SmBoolean                bCheckUVCurves,    // in : as MakeTopologyFromData() above
+  SmBoolean                bAlwaysHeal,       // in : as MakeTopologyFromData() above
+  SmBoolean                bHealerIsEnabled,  // in : as MakeTopologyFromData() above
+  SmBoolean                bTakeGeometry)     // in : TRUE = take pBrepData's geometry where a copy would be a clone
 {
   SM_REF1(bCheckUVCurves) ;
  NER(this);
@@ -19366,6 +19450,30 @@ static ULONG lFileCount = 0;
       pBrepData->m_bIsGeomBorrowed = FALSE;
 
     } // end m_bIsGeomBorrowed == TRUE check
+
+  // when taking geometry: the number of users of each surface and curve
+  SmTArray<ULONG> sSurfaceUsers, s3DCurveUsers, sUVCurveUsers;
+  if (bTakeGeometry && !bAddAnalytics)
+    {
+      sSurfaceUsers.InsertAt(0, 0, pBrepData->m_vSurfaces.GetSize());
+      s3DCurveUsers.InsertAt(0, 0, pBrepData->m_v3DCurves.GetSize());
+      sUVCurveUsers.InsertAt(0, 0, pBrepData->m_vUVCurves.GetSize());
+      for (ULONG ii=0; ii<pBrepData->m_vFaces.GetSize(); ii++)
+        {
+          ULONG lIndex = pBrepData->m_vFaces[ii].m_lSurface;
+          if (lIndex < sSurfaceUsers.GetSize()) { sSurfaceUsers[lIndex]++; }
+        }
+      for (ULONG ii=0; ii<pBrepData->m_vEdges.GetSize(); ii++)
+        {
+          ULONG lIndex = pBrepData->m_vEdges[ii].m_lCurve;
+          if (lIndex < s3DCurveUsers.GetSize()) { s3DCurveUsers[lIndex]++; }
+        }
+      for (ULONG ii=0; ii<pBrepData->m_vEdgeuses.GetSize(); ii++)
+        {
+          ULONG lIndex = pBrepData->m_vEdgeuses[ii].m_lUVCurve;
+          if (lIndex < sUVCurveUsers.GetSize()) { sUVCurveUsers[lIndex]++; }
+        }
+    }
 
   // attach any Brep attributes referenced by global index to this SmBrep Object
   SER(sm_AddAttributes(this,pBrepData->m_vAttributes,rAllAttributes));
@@ -19654,7 +19762,16 @@ else  // branch to translate a non-manifold part or a SmBrepData object created
 
         // Set Face data
         SmSurface *pFaceSurf = pBrepData->m_vSurfaces[rF.m_lSurface];
-        if (pFaceSurf->GetOwner() == NULL)
+        if (   rF.m_lSurface < sSurfaceUsers.GetSize()
+            && sSurfaceUsers[rF.m_lSurface] == 1
+            && sm_MakeGeometryAsItsCopy(pFaceSurf, GetContext()))
+          {
+            // take the surface
+            pBrepData->m_vSurfaces[rF.m_lSurface] = NULL;
+            pNewF->m_pSurface = pFaceSurf;
+            pFaceSurf->SetOwner(pNewF);
+          }
+        else if (pFaceSurf->GetOwner() == NULL)
           {
 #ifdef SM_DEBUG_CODE
             if(bDebugCount)
@@ -19854,8 +19971,17 @@ else  // branch to translate a non-manifold part or a SmBrepData object created
         SmCurve * pEdgeCrv = pBrepData->m_v3DCurves[rE.m_lCurve] ;
         // SmBSplineCurve * pEdgeCrv = SM_CAST_PTR(SmBSplineCurve,pBrepData->m_v3DCurves[rE.m_lCurve]);
 
+        if (   rE.m_lCurve < s3DCurveUsers.GetSize()
+            && s3DCurveUsers[rE.m_lCurve] == 1
+            && sm_MakeGeometryAsItsCopy(pEdgeCrv, GetContext()))
+          {
+            // take the curve
+            pBrepData->m_v3DCurves[rE.m_lCurve] = NULL;
+            pNewE->m_pCurve = pEdgeCrv;
+            pEdgeCrv->SetOwner(pNewE);
+          }
         // Prevent duplication by setting owner once curve has been copied one time
-        if (pEdgeCrv->GetOwner() == NULL)
+        else if (pEdgeCrv->GetOwner() == NULL)
           {
             SmCurve *pNewBSC = NULL;
             SmObjDelete sNewCurveCleanup;
@@ -20129,7 +20255,18 @@ else  // branch to translate a non-manifold part or a SmBrepData object created
                 pNewEU2->m_pSorLU       = pL->m_pLU->m_pLUMate;
 
                 // Put trim curve on EU1 if it is present
-                if (rEU.m_lUVCurve < 999999)
+                if (   rEU.m_lUVCurve < 999999
+                    && rEU.m_lUVCurve < sUVCurveUsers.GetSize()
+                    && sUVCurveUsers[rEU.m_lUVCurve] == 1
+                    && sm_MakeGeometryAsItsCopy(pBrepData->m_vUVCurves[rEU.m_lUVCurve], GetContext()))
+                  {
+                    // take the curve
+                    SmCurve *pUVCurve = pBrepData->m_vUVCurves[rEU.m_lUVCurve];
+                    pBrepData->m_vUVCurves[rEU.m_lUVCurve] = NULL;
+                    pNewEU1->m_pUVTrimCurve = SM_CAST_PTR(SmBSplineCurve,pUVCurve);
+                    pUVCurve->SetOwner(pNewEU1);
+                  }
+                else if (rEU.m_lUVCurve < 999999)
                   {
                     SmCurve *pUVCurve = pBrepData->m_vUVCurves[rEU.m_lUVCurve];
                     SmCurve *pNewUV   = NULL;

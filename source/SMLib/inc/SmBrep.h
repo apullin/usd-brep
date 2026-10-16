@@ -1081,6 +1081,18 @@ public:
                                                                                         //      a flag for internal development
                                 SmBoolean                bHealerIsEnabled = TRUE );     // in : default TRUE: healer is enabled  FALSE: disable healer in any case
                                                                                         
+  // MakeTopologyFromData() above that, when bTakeGeometry is TRUE, uses pBrepData's surfaces and curves
+  // instead of copies wherever a copy would be a clone; pBrepData is only good for deleting then
+  SmStatus MakeTopologyFromData(SmBrepData             * pBrepData,
+                                SmTArray<SmAttribute*> & rAllAttributes,
+                                SmBoolean                bMakeUVTrimCurves,
+                                SmBoolean                bAddAnalytics,
+                                SmBoolean                bForceSameTol,
+                                SmBoolean                bCheckUVTrimCurves,
+                                SmBoolean                bAlwaysHeal,
+                                SmBoolean                bHealerIsEnabled,
+                                SmBoolean                bTakeGeometry);
+
 
   // A MakeTopologyFromData helper function to fix common read in database problems
   SmStatus HealBrep(SmHealerOpType          eHealerOp,                 // in : Run Healer sequence up to and including this operation.  Oneof:

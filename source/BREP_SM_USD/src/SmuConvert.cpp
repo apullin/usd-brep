@@ -2853,6 +2853,12 @@ SmBoolean bDebugMe = FALSE;
     // Conversion to analytics can be completed as a separate heal step
     SmBoolean bCreateUVTrimCurves = FALSE;
     SmBoolean bConvertToAnalytics = FALSE;
+    // The Brep takes pBrepData_ii's geometry where a copy would be a clone (the debug output below writes it)
+#ifdef SM_DEBUG_CODE
+    SmBoolean bTakeGeometry = !bDebugMe;
+#else
+    SmBoolean bTakeGeometry = TRUE;
+#endif
     SmStatus topologyStatus = pBrep_ii->MakeTopologyFromData(pBrepData_ii,        // in : target BrepData object
                                                              sAttributes,         // in : list of all attributes to be assigned to Brep entities
                                                                                   //      currently contains one placeholder attribute
@@ -2864,7 +2870,8 @@ SmBoolean bDebugMe = FALSE;
                                                                                   //      when reading breps set TRUE (use original tol);
                                                              FALSE,               // in : bCheckUVTrimCurves
                                                              FALSE,               // in : bAlwaysHeal
-                                                             bHealerIsEnabled);   // in : bHealerIsEnabled
+                                                             bHealerIsEnabled,    // in : bHealerIsEnabled
+                                                             bTakeGeometry);      // in : bTakeGeometry
 
     if (topologyStatus != SM_SUCCESS)
       {
