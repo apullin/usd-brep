@@ -167,6 +167,11 @@ public:
 
   SmStatus BuildTreeWithSubdivision(SmBSplineSurface *pBSS);
 
+  // BuildTreeWithSubdivision() for SmTessellateFast() (SmTessFast.cpp): the same tests, splits and
+  // blocks, so the same tree, without the node bounding boxes and refined in parallel. BuildTree()
+  // calls it instead when m_pSurfaceTessDriver->GetType() == SmFastSurfaceTessDriver_TYPE.
+  SmStatus BuildTreeFast(SmBSplineSurface *pBSS);
+
 
   SmFace     * GetFace()        const { return m_pFace; }
   SmPolyBrep * GetTS_PolyBrep() const { return mTS_pPolyBrep ; }

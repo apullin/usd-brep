@@ -797,6 +797,9 @@ public:
   // TRUE when the tree has been built (GetTree() builds it when needed)
   SmBoolean HasTree() const { return m_pTree != NULL; }
 
+  // the tree as built so far, or NULL; unlike GetTree() it never builds or extends it
+  const SmTree * GetBuiltTree() const { return m_pTree; }
+
   SmStatus GetCorners
   (
     gw_SURFACE       * pGWSurface,      ///< [in ]: optional Surface to check                                 <br>

@@ -14307,7 +14307,11 @@ SmStatus SmTessSrfCache::BuildTree
           // creates one single starter node for entire BSpline Surface -
           // Then subdivides that until pieces pass the tessellation tests
           //    Every TreeNode->m_eAuxDataType == SM_AD_AUX_DATA where m_pData is type SmBezierAux2d.
-          SER(BuildTreeWithSubdivision(pBSS)) ;
+          if (   m_pSurfaceTessDriver != NULL
+              && m_pSurfaceTessDriver->GetType() == SmFastSurfaceTessDriver_TYPE)
+            { SER(BuildTreeFast(pBSS)); }
+          else
+            { SER(BuildTreeWithSubdivision(pBSS)) ; }
         }
       else // surface is not a BSplineSurface
         {
