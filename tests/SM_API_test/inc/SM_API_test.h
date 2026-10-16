@@ -98,6 +98,7 @@ API_EXPORT SmStatus TestSmPrincipalDirectionPairing();
 API_EXPORT SmStatus TestSmSTEPDerivativeUnits();
 API_EXPORT SmStatus TestSmSTEPDerivativesExample();
 API_EXPORT SmStatus TestSmConeSTEPCrossDerivative();
+API_EXPORT SmStatus TestSmCanonicalOnSTEPUVDomain();
 API_EXPORT SmStatus TestSmPlanarFacesFailureCleanup();
 API_EXPORT SmStatus TestSmEdgeCurveOwnership();
 API_EXPORT SmStatus TestSmCurveSweepFailureCleanup();

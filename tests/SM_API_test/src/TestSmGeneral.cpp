@@ -36,8 +36,10 @@
 #include <SmPoly.h>
 #include <SmSurface.h>
 #include <SmTrimmingTools.h>
+#include <nurbs.h>
 
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 static SmBoolean sm_TestPointClose(const SmPoint3d& crActual, const SmPoint3d& crExpected)
@@ -970,6 +972,145 @@ SmStatus TestSmPrincipalDirectionPairing()
         return SM_ERR;
 
     return SM_SUCCESS;
+}
+
+//*************************************************************************
+// CreateCanonicalOnSTEPUVDomain must make, bit for bit, the surface of
+// CreateCanonical() then AdjustSTEPUVDomain(): Nurb, STEP domain, generator,
+// polar converter curve and STEP <-> Nurb conversions.
+//*************************************************************************
+
+static bool sm_SameBits(double dA, double dB)
+{
+    return std::memcmp(&dA, &dB, sizeof(double)) == 0;
+}
+
+static bool sm_SameKnots(const gw_KNOTVECTOR* pA, const gw_KNOTVECTOR* pB)
+{
+    if( pA->m != pB->m )
+        return false;
+    for( long i = 0; i <= pA->m; i++ )
+        if( !sm_SameBits(pA->U[i], pB->U[i]) )
+            return false;
+    return true;
+}
+
+static bool sm_SameCPoint(const gw_CPOINT& rA, const gw_CPOINT& rB)
+{
+    return sm_SameBits(rA.x, rB.x) && sm_SameBits(rA.y, rB.y) && sm_SameBits(rA.z, rB.z) && sm_SameBits(rA.w, rB.w);
+}
+
+static bool sm_SameCurve(const SmBSplineCurve* pA, const SmBSplineCurve* pB)
+{
+    if( pA == NULL || pB == NULL )
+        return pA == pB;
+    const gw_CURVE* pNA = pA->GetGwNurbPointer();
+    const gw_CURVE* pNB = pB->GetGwNurbPointer();
+    if( pNA == NULL || pNB == NULL || pNA->p != pNB->p || pNA->pol->n != pNB->pol->n || !sm_SameKnots(pNA->knt, pNB->knt) )
+        return false;
+    for( long i = 0; i <= pNA->pol->n; i++ )
+        if( !sm_SameCPoint(pNA->pol->Pw[i], pNB->pol->Pw[i]) )
+            return false;
+    const SmExtent1d sIA = pA->GetSTEPInterval(), sIB = pB->GetSTEPInterval();
+    return sm_SameBits(sIA.GetMin(), sIB.GetMin()) && sm_SameBits(sIA.GetMax(), sIB.GetMax());
+}
+
+static bool sm_SameSurfOfRevolution(const SmSurfOfRevolution* pA, const SmSurfOfRevolution* pB)
+{
+    const gw_SURFACE* pNA = pA->GetGwNurbPointer();
+    const gw_SURFACE* pNB = pB->GetGwNurbPointer();
+    if( pNA == NULL || pNB == NULL || pNA->p != pNB->p || pNA->q != pNB->q
+        || pNA->net->n != pNB->net->n || pNA->net->m != pNB->net->m
+        || !sm_SameKnots(pNA->knu, pNB->knu) || !sm_SameKnots(pNA->knv, pNB->knv) )
+        return false;
+    for( long i = 0; i <= pNA->net->n; i++ )
+        for( long j = 0; j <= pNA->net->m; j++ )
+            if( !sm_SameCPoint(pNA->net->Pw[i][j], pNB->net->Pw[i][j]) )
+                return false;
+    const SmExtent2d sDA = pA->GetSTEPUVDomain(), sDB = pB->GetSTEPUVDomain();
+    if( !sm_SameBits(sDA.GetUMin(), sDB.GetUMin()) || !sm_SameBits(sDA.GetUMax(), sDB.GetUMax())
+        || !sm_SameBits(sDA.GetVMin(), sDB.GetVMin()) || !sm_SameBits(sDA.GetVMax(), sDB.GetVMax()) )
+        return false;
+    if( !sm_SameCurve(pA->GetGenCurve(), pB->GetGenCurve())
+        || pA->HavePolarConversion() != pB->HavePolarConversion()
+        || !sm_SameCurve(pA->GetPolarConversionCurve(), pB->GetPolarConversionCurve()) )
+        return false;
+    for( int i = 0; i <= 4; i++ )
+    {
+        for( int j = 0; j <= 4; j++ )
+        {
+            const SmPoint2d sSTEP = sDA.Evaluate(i / 4.0, j / 4.0);
+            SmPoint2d sA, sB, sBackA, sBackB;
+            if( pA->ConvertUVFromSTEPToNURBS(sSTEP, sA) != pB->ConvertUVFromSTEPToNURBS(sSTEP, sB)
+                || !sm_SameBits(sA.x, sB.x) || !sm_SameBits(sA.y, sB.y)
+                || pA->ConvertUVFromNURBSToSTEP(sA, sBackA) != pB->ConvertUVFromNURBSToSTEP(sB, sBackB)
+                || !sm_SameBits(sBackA.x, sBackB.x) || !sm_SameBits(sBackA.y, sBackB.y) )
+                return false;
+        }
+    }
+    return true;
+}
+
+SmStatus TestSmCanonicalOnSTEPUVDomain()
+{
+    SmApiCreateContext();
+    SmContext& rContext = *SmApiGetOrCreateContext();
+    SmVector3d sZ(0.3, -0.4, 0.866);
+    sZ.Unitize();
+    SmVector3d sX = SmVector3d(0.0, 0.0, 1.0) * sZ;
+    sX.Unitize();
+    const SmAxis2Placement sPlacement(SmPoint3d(12.5, -3.25, 40.0), sX, sZ * sX);
+    const SmExtent2d aDomains[] = { SmExtent2d(0.0, -2.0, 90.0, 7.5), SmExtent2d(30.0, 1.0, 300.0, 2.0),
+                                    SmExtent2d(-45.0, -30.0, 45.0, 60.0), SmExtent2d(270.0, 0.0, 360.0, 180.0),
+                                    SmExtent2d(0.0, -90.0, 360.0, 90.0), SmExtent2d(0.0, 0.0, 360.0, 360.0) };
+    int iAdjusted = 0;
+    for( const SmExtent2d& rDomain : aDomains )
+    {
+        for( int iType = 0; iType < 3; iType++ )
+        {
+            // the domains are angles for tori and spheres
+            SmExtent2d sDomain = rDomain;
+            if( iType == 2 && sDomain.GetVMax() > 90.0 )
+                continue;
+            SmSurfOfRevolution* pA = NULL;
+            SmSurfOfRevolution* pB = NULL;
+            SmBoolean bAdjusted = FALSE;
+            if( iType == 0 )
+            {
+                SmCylinder *pCylA = NULL, *pCylB = NULL;
+                SER( SmCylinder::CreateCanonical(rContext, sPlacement, 2.75, pCylA) );
+                SER( SmCylinder::CreateCanonicalOnSTEPUVDomain(rContext, sPlacement, 2.75, sDomain, pCylB, bAdjusted) );
+                pA = pCylA;
+                pB = pCylB;
+            }
+            else if( iType == 1 )
+            {
+                SmTorus *pTorA = NULL, *pTorB = NULL;
+                SER( SmTorus::CreateCanonical(rContext, sPlacement, 6.0, 1.5, pTorA) );
+                SER( SmTorus::CreateCanonicalOnSTEPUVDomain(rContext, sPlacement, 6.0, 1.5, sDomain, pTorB, bAdjusted) );
+                pA = pTorA;
+                pB = pTorB;
+            }
+            else
+            {
+                SmSphere *pSphA = NULL, *pSphB = NULL;
+                SER( SmSphere::CreateCanonical(rContext, sPlacement, 4.0, pSphA) );
+                SER( SmSphere::CreateCanonicalOnSTEPUVDomain(rContext, sPlacement, 4.0, sDomain, pSphB, bAdjusted) );
+                pA = pSphA;
+                pB = pSphB;
+            }
+            SmObjDelete sCleanA(pA), sCleanB(pB);
+            SER( pA->AdjustSTEPUVDomain(sDomain) );
+            if( bAdjusted )
+                iAdjusted++;
+            else
+                SER( pB->AdjustSTEPUVDomain(sDomain) );
+            if( !sm_SameSurfOfRevolution(pA, pB) )
+                return SM_ERR;
+        }
+    }
+    // the one-step path ran (not only the fallback)
+    return iAdjusted >= 8 ? SM_SUCCESS : SM_ERR;
 }
 
 //*************************************************************************
