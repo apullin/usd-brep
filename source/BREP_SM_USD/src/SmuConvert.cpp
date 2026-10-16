@@ -3470,6 +3470,7 @@ SmBoolean bDebugMe = FALSE;
 
                 SmCone * pCone = NULL ;
                 SmStatus stat = SM_ERR ;
+                SmBoolean bAdjusted = FALSE ;
                 SmVector3d sYAxis = sZAxis * sXAxis ;
                 SmPoint3d sConeOrigin(sOriginPt[0], sOriginPt[1], sOriginPt[2]) ;
 
@@ -3491,14 +3492,17 @@ SmBoolean bDebugMe = FALSE;
                         sConeOrigin += dVMin * sZAxis ;
                         SmAxis2Placement sPlacement ;
                         sPlacement.SetCanonical(sConeOrigin, sXAxis, sYAxis) ;
-                        stat = SmCone::CreateCanonical(
+                        sDomain.SetMinMax(sDomain.GetUMin(), 0.0, sDomain.GetUMax(), dHeight) ;
+                        // CreateCanonical then AdjustSTEPUVDomain, both in one step (bAdjusted) when that can build the NURB once
+                        stat = SmCone::CreateCanonicalOnSTEPUVDomain(
                             *prSmBrepData_ii->GetContext(),
                             sPlacement,
                             smos_Max(0.0, dBottomRadius),
                             smos_Max(0.0, dTopRadius),
                             dHeight,
-                            pCone) ;
-                        sDomain.SetMinMax(sDomain.GetUMin(), 0.0, sDomain.GetUMax(), dHeight) ;
+                            sDomain,
+                            pCone,
+                            bAdjusted) ;
                       }
                   }
                 else
@@ -3517,7 +3521,7 @@ SmBoolean bDebugMe = FALSE;
                     return (stat != SM_SUCCESS) ? stat : SM_ERR;
                   }
 
-                if (sDomain.IsBounded())
+                if (sDomain.IsBounded() && !bAdjusted)
                   {
                     SmStatus adjStat = pCone->AdjustSTEPUVDomain(sDomain) ;
                     if (adjStat != SM_SUCCESS)

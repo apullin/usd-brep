@@ -277,6 +277,21 @@ public:
     SmBoolean                bInsideOut = FALSE   ///< [in] : optional: FALSE= ZAxis from Bot to Top, TRUE=negate,                         <br>
   );
 
+  // CreateCanonical() above with its default options, then AdjustSTEPUVDomain(crSTEPUVDomain) building the Nurb
+  // once (rbAdjusted = TRUE), bit for bit the same cone; rbAdjusted = FALSE: CreateCanonical()'s result, call
+  // AdjustSTEPUVDomain() next
+  static SmStatus CreateCanonicalOnSTEPUVDomain
+  (
+    const SmContext        & crContext,           ///< [in] : as CreateCanonical()                                                         <br>
+    const SmAxis2Placement & crOrigin,            ///< [in] : as CreateCanonical()                                                         <br>
+    double                   dBotRadius,          ///< [in] : as CreateCanonical()                                                         <br>
+    double                   dTopRadius,          ///< [in] : as CreateCanonical()                                                         <br>
+    double                   dHeight,             ///< [in] : as CreateCanonical()                                                         <br>
+    const SmExtent2d       & crSTEPUVDomain,      ///< [in] : as AdjustSTEPUVDomain()                                                      <br>
+    SmCone                *& rpNewCone,           ///< [out]: as CreateCanonical()                                                         <br>
+    SmBoolean              & rbAdjusted           ///< [out]: TRUE = AdjustSTEPUVDomain(crSTEPUVDomain) done                               <br>
+  );
+
   // create offset surface - Out Surf->Domain(s) may be trimmed but not scaled
   virtual SmStatus CreateOffsetSurface
   (

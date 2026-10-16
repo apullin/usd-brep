@@ -977,7 +977,8 @@ SmStatus TestSmPrincipalDirectionPairing()
 //*************************************************************************
 // CreateCanonicalOnSTEPUVDomain must make, bit for bit, the surface of
 // CreateCanonical() then AdjustSTEPUVDomain(): Nurb, STEP domain, generator,
-// polar converter curve and STEP <-> Nurb conversions.
+// polar converter curve and STEP <-> Nurb conversions. Cylinders, tori,
+// spheres, and bounded cones and cylinders made as cones.
 //*************************************************************************
 
 static bool sm_SameBits(double dA, double dB)
@@ -1066,12 +1067,16 @@ SmStatus TestSmCanonicalOnSTEPUVDomain()
     int iAdjusted = 0;
     for( const SmExtent2d& rDomain : aDomains )
     {
-        for( int iType = 0; iType < 3; iType++ )
+        for( int iType = 0; iType < 5; iType++ )
         {
-            // the domains are angles for tori and spheres
+            // the domains are angles for tori and spheres; bounded cones span V [0, 3]
             SmExtent2d sDomain = rDomain;
             if( iType == 2 && sDomain.GetVMax() > 90.0 )
                 continue;
+            if( iType == 3 )
+                sDomain.SetMinMax(rDomain.GetUMin(), 0.0, rDomain.GetUMax(), 3.0);
+            if( iType == 4 )
+                sDomain.SetMinMax(rDomain.GetUMin(), 0.5, rDomain.GetUMax(), 2.0);
             SmSurfOfRevolution* pA = NULL;
             SmSurfOfRevolution* pB = NULL;
             SmBoolean bAdjusted = FALSE;
@@ -1090,6 +1095,15 @@ SmStatus TestSmCanonicalOnSTEPUVDomain()
                 SER( SmTorus::CreateCanonicalOnSTEPUVDomain(rContext, sPlacement, 6.0, 1.5, sDomain, pTorB, bAdjusted) );
                 pA = pTorA;
                 pB = pTorB;
+            }
+            else if( iType >= 3 )
+            {
+                SmCone *pConeA = NULL, *pConeB = NULL;
+                SER( SmCone::CreateCanonical(rContext, sPlacement, 2.0, iType == 3 ? 1.25 : 2.0, 3.0, pConeA) );
+                SER( SmCone::CreateCanonicalOnSTEPUVDomain(rContext, sPlacement, 2.0, iType == 3 ? 1.25 : 2.0, 3.0, sDomain,
+                                                            pConeB, bAdjusted) );
+                pA = pConeA;
+                pB = pConeB;
             }
             else
             {
@@ -1110,7 +1124,7 @@ SmStatus TestSmCanonicalOnSTEPUVDomain()
         }
     }
     // the one-step path ran (not only the fallback)
-    return iAdjusted >= 8 ? SM_SUCCESS : SM_ERR;
+    return iAdjusted >= 16 ? SM_SUCCESS : SM_ERR;
 }
 
 //*************************************************************************

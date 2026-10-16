@@ -436,6 +436,77 @@ SmStatus SmCone::CreateCanonical
 } // end SmCone::CreateCanonical
 
 /*******************************************************************//**
+PURPOSE: CreateCanonical() for a bounded cone, then AdjustSTEPUVDomain()
+    without building the whole cone's Nurb first.
+
+NOTES: rbAdjusted = TRUE : bit for bit CreateCanonical() then
+                           AdjustSTEPUVDomain(crSTEPUVDomain)'s cone.
+       rbAdjusted = FALSE: CreateCanonical()'s result and status; call
+                           AdjustSTEPUVDomain() next.
+       See SmSurfOfRevolution::MakeNurbOnSTEPUVDomain().
+***********************************************************************/
+SmStatus SmCone::CreateCanonicalOnSTEPUVDomain
+  (const SmContext        & crContext,
+   const SmAxis2Placement & crOrigin,
+   double                   dBotRadius,
+   double                   dTopRadius,
+   double                   dHeight,
+   const SmExtent2d       & crSTEPUVDomain,
+   SmCone                *& rpNewCone,
+   SmBoolean              & rbAdjusted)
+{
+  rbAdjusted = FALSE;
+  if(dHeight <= 0)
+    { return CreateCanonical(crContext, crOrigin, dBotRadius, dTopRadius, dHeight, rpNewCone); }
+
+  // as CreateCanonical()
+  rpNewCone = new (crContext) SmCone(crOrigin.GetOriginRef(),
+                                     crOrigin.GetXAxisRef(),
+                                     crOrigin.GetYAxisRef(),
+                                     dBotRadius,
+                                     dTopRadius,
+                                     0.0,
+                                     360.0,
+                                     dHeight,
+                                     FALSE,
+                                     FALSE,
+                                     FALSE) ;
+  NER(rpNewCone);
+
+  SM_ASSERT(rpNewCone->m_pGenCurve != NULL) ;
+  if (rpNewCone->m_pGenCurve == NULL)
+    { delete rpNewCone; rpNewCone = NULL; SER(SM_ERR); } // Failure in constructor
+
+  // AdjustSTEPUVDomain()'s checks pass
+  SmExtent1d sVDomain = crSTEPUVDomain.GetVInterval();
+  SmBoolean  bTouched = FALSE;
+  if (   rpNewCone->GetRadius( sVDomain.GetMin() ) >= -SM_EFF_ZERO
+      && rpNewCone->GetRadius( sVDomain.GetMax() ) >= -SM_EFF_ZERO
+      && rpNewCone->MakeNurbOnSTEPUVDomain(crSTEPUVDomain, bTouched))
+    {
+      rbAdjusted = TRUE;
+      return SM_SUCCESS;
+    }
+  if (bTouched)
+    {
+      delete rpNewCone; rpNewCone = NULL;
+      return CreateCanonical(crContext, crOrigin, dBotRadius, dTopRadius, dHeight, rpNewCone);
+    }
+
+  // the rest of CreateCanonical()
+  if (rpNewCone->MakeNurb() != SM_SUCCESS || rpNewCone->GetGwNurbPointer() == NULL)
+    {
+      delete rpNewCone; rpNewCone = NULL;
+      SE_MSG(SM_ERR, _T("SmCone::CreateCanonical: failed to build NURB representation")) ;
+      return SM_ERR;
+    }
+
+  SM_DUMP_AND_ASSERT2_VALID(rpNewCone) ;
+  return SM_SUCCESS;
+
+} // end SmCone::CreateCanonicalOnSTEPUVDomain
+
+/*******************************************************************//**
 PURPOSE: Adjust the surface by the given STEP-domain.
 
 NOTES:
