@@ -27,7 +27,11 @@ PURPOSE:
 #include <SmFilletStandardSolver.h>
 #include <SmOffsetExecutive.h>
 #include <SmStitch.h>
+#include <SmTessFast.h>
 #include <SmTol.h>
+
+#include <algorithm>
+#include <vector>
 
 #if SM_DEBUG_CODE
 static const SmVector3d s_kBlack(0, 0, 0);
@@ -764,6 +768,96 @@ SmApiStatus SmApiTessellate
   return(eStatus);
 
 } // End SmApiTessellate
+
+
+/*******************************************************************//**
+PURPOSE --- Replace rTarget with crSource converted to TYPE; empty on failure.
+***********************************************************************/
+template<class TYPE, class SOURCE>
+static SmApiStatus SmApiCopyToArray
+(
+    const std::vector<SOURCE>& crSource,  ///< [in ]: Values
+    SmTArray<TYPE>&            rTarget    ///< [out]: Copy
+)
+{
+  rTarget.RemoveAll();
+  if (crSource.empty())
+    return SM_SUCCESS;
+  if (crSource.size() >= SM_BIG_ULONG || rTarget.SetSize(static_cast<ULONG>(crSource.size())) >= SM_BIG_ULONG)
+    return SM_ERR_OUT_OF_MEMORY;
+  std::transform(crSource.begin(), crSource.end(), rTarget.GetDataArray(),
+                 [](const SOURCE& crValue) { return static_cast<TYPE>(crValue); });
+  return SM_SUCCESS;
+}
+
+/****************************************************************************************
+PURPOSE: Opt-in fast tessellation into flat arrays (SmTessellateFast, SmTessFast.h).
+
+NOTES: Rejects failed faces unless bAllowPartial is TRUE, and fails without faces or when
+       every face failed, as SmApiTessellate does. Errors leave the arrays empty but keep
+       the per-face kinds and counts when the faces were tessellated.
+****************************************************************************************/
+SmApiStatus SmApiTessellateFast
+(
+    const SmBrep* pBrep,                        ///< [in ]: Brep to tessellate; not modified
+    SmFastTessellation& rMesh,                  ///< [out]: Resulting mesh arrays
+    const SmTessellationParams& rParams,        ///< [in ]: Quality controls
+    SmBoolean bAllowPartial,                    ///< [in ]: Retain the other faces when some faces fail
+    SmBoolean bCornerNormals                    ///< [in ]: Also fill rMesh.sCornerNormals
+)
+{
+  auto ClearArrays = [&rMesh]()
+  {
+    rMesh.sPoints.RemoveAll();
+    rMesh.sNormals.RemoveAll();
+    rMesh.sTriangles.RemoveAll();
+    rMesh.sTriangleFaces.RemoveAll();
+    rMesh.sCornerNormals.RemoveAll();
+  };
+  ClearArrays();
+  rMesh.sFaceKinds.RemoveAll();
+  rMesh.lFastFaces = rMesh.lFallbackFaces = rMesh.lFailedFaces = 0;
+
+  // Validate non-null input
+  NER_MSG(pBrep, _T("Null Brep input"));
+
+  // Failed faces are rejected here rather than by the kernel, after recording which they are.
+  SmFastOptions sOptions;
+  sOptions.bCornerNormals = bCornerNormals ? TRUE : FALSE;
+  sOptions.bAllowPartial  = TRUE;
+  SmFastMesh sMesh;
+  const SmStatus eStatus = SmTessellateFast(pBrep, rParams, sMesh, sOptions);
+
+  SER(SmApiCopyToArray(sMesh.sFaceKinds, rMesh.sFaceKinds));
+  rMesh.lFastFaces     = sMesh.lFastFaces;
+  rMesh.lFallbackFaces = sMesh.lFallbackFaces;
+  rMesh.lFailedFaces   = sMesh.lFailedFaces;
+  if (eStatus != SM_SUCCESS)
+    return eStatus;
+  // As SmApiTessellate, which has no mesh when no face reached its output
+  if (sMesh.lFastFaces + sMesh.lFallbackFaces == 0)
+  {
+    SER_MSG(SM_ERR, _T("Tessellation failed to produce a mesh"));
+  }
+  if (sMesh.lFailedFaces > 0 && !bAllowPartial)
+  {
+    SER_MSG(SM_ERR, _T("Tessellation failed to produce a complete mesh"));
+  }
+
+  SmApiStatus eCopy = SmApiCopyToArray(sMesh.sPoints, rMesh.sPoints);
+  if (eCopy == SM_SUCCESS) eCopy = SmApiCopyToArray(sMesh.sNormals, rMesh.sNormals);
+  if (eCopy == SM_SUCCESS) eCopy = SmApiCopyToArray(sMesh.sTriangles, rMesh.sTriangles);
+  if (eCopy == SM_SUCCESS) eCopy = SmApiCopyToArray(sMesh.sTriangleFaces, rMesh.sTriangleFaces);
+  if (eCopy == SM_SUCCESS) eCopy = SmApiCopyToArray(sMesh.sCornerNormals, rMesh.sCornerNormals);
+  if (eCopy != SM_SUCCESS)
+  {
+    ClearArrays();
+    SER_MSG(eCopy, _T("Out of memory copying the mesh arrays"));
+  }
+
+  return(SM_SUCCESS);
+
+} // End SmApiTessellateFast
 
 
 /*******************************************************************//**

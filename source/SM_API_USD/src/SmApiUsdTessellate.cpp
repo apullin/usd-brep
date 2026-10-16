@@ -35,14 +35,153 @@
 #include "SmApiBrep.h"
 #include "SmBrep.h"
 #include "SmContext.h"
+#include "SmFace.h"
 #include "SmMessages.h"
 
 #include <tbb/parallel_for.h>
 #include <tbb/task_arena.h>
 
 #include <algorithm>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <memory>
+#include <unordered_map>
+
+SmApiUsdTessellator SmApiUsdGetDefaultTessellator()
+{
+    static const SmApiUsdTessellator seDefault = []
+    {
+        const char* pValue = std::getenv("SMLIB_FAST_TESSELLATION");
+        return (pValue && std::strcmp(pValue, "1") == 0) ? SM_API_USD_TESSELLATOR_FAST : SM_API_USD_TESSELLATOR_SMLIB;
+    }();
+    return seDefault;
+}
+
+// GetTessellatedMeshData's arrays from SmApiTessellateFast's output, with its conventions: float points and
+// extent, one USD face per triangle, face-varying normals indexed per corner with one normal per vertex and
+// Brep face, and one GeomSubset per face material attribute with its first path. GetMeshData orders the
+// subsets by an unordered_map; here they come in the order of their first face.
+static SmStatus sm_GetFastMeshData(const SmBrep& crBrep, const SmFastTessellation& crMesh, SmApiUsdTessellatedBrep& rResult)
+{
+    const ULONG lVertices  = crMesh.sPoints.GetSize() / 3;
+    const ULONG lTriangles = crMesh.sTriangles.GetSize() / 3;
+    if (crMesh.sPoints.GetSize() != 3 * lVertices || crMesh.sTriangles.GetSize() != 3 * lTriangles
+        || crMesh.sTriangleFaces.GetSize() != lTriangles || crMesh.sCornerNormals.GetSize() != 9 * lTriangles
+        || lVertices > static_cast<ULONG>(INT_MAX) || lTriangles > static_cast<ULONG>(INT_MAX / 3))
+        return SM_ERR;
+    SmTArray<SmFace*> sFaces;
+    crBrep.GetFaces(sFaces);
+
+    SmExtent3d sBox;
+    pxr::VtArray<pxr::GfVec3f> sPoints(lVertices);
+    for (ULONG ii = 0; ii < lVertices; ++ii)
+    {
+        const SmPoint3d sPoint(crMesh.sPoints[3 * ii], crMesh.sPoints[3 * ii + 1], crMesh.sPoints[3 * ii + 2]);
+        sBox.AddPoint3d(sPoint);
+        sPoints[ii] = pxr::GfVec3f(static_cast<float>(sPoint.x), static_cast<float>(sPoint.y), static_cast<float>(sPoint.z));
+    }
+    pxr::VtArray<pxr::GfVec3f> sExtent;
+    if (!sBox.IsInit())
+    {
+        const SmPoint3d sMin = sBox.GetMin(), sMax = sBox.GetMax();
+        sExtent = { pxr::GfVec3f(static_cast<float>(sMin.x), static_cast<float>(sMin.y), static_cast<float>(sMin.z)),
+                    pxr::GfVec3f(static_cast<float>(sMax.x), static_cast<float>(sMax.y), static_cast<float>(sMax.z)) };
+    }
+
+    pxr::VtIntArray sCounts(lTriangles, 3);
+    pxr::VtIntArray sIndices(3 * lTriangles);
+    pxr::VtIntArray sNormalIndices(3 * lTriangles);
+    pxr::VtArray<pxr::GfVec3f> sNormals;
+    sNormals.reserve(lVertices);
+    // The normal of each vertex for the last face that used it. A face's triangles are consecutive, so a
+    // vertex gets one normal per face, unless its corners in a face have different normals.
+    std::vector<int> sLastFace(lVertices, -1), sLastNormal(lVertices, -1);
+    std::vector<SmSdfPathAttribute*> sMaterials;
+    std::vector<std::vector<int>> sSubsets;
+    std::unordered_map<SmSdfPathAttribute*, size_t> sSubsetOfMaterial;
+    for (ULONG tt = 0; tt < lTriangles; ++tt)
+    {
+        const int iFace = crMesh.sTriangleFaces[tt];
+        if (iFace < 0 || static_cast<ULONG>(iFace) >= sFaces.GetSize())
+            return SM_ERR;
+        for (ULONG cc = 3 * tt; cc < 3 * tt + 3; ++cc)
+        {
+            const int iVertex = crMesh.sTriangles[cc];
+            if (iVertex < 0 || static_cast<ULONG>(iVertex) >= lVertices)
+                return SM_ERR;
+            pxr::GfVec3f sNormal(crMesh.sCornerNormals[3 * cc], crMesh.sCornerNormals[3 * cc + 1], crMesh.sCornerNormals[3 * cc + 2]);
+            sNormal.Normalize();
+            if (sLastFace[iVertex] != iFace || sNormals[sLastNormal[iVertex]] != sNormal)
+            {
+                sLastFace[iVertex] = iFace;
+                sLastNormal[iVertex] = static_cast<int>(sNormals.size());
+                sNormals.push_back(sNormal);
+            }
+            sIndices[cc] = iVertex;
+            sNormalIndices[cc] = sLastNormal[iVertex];
+        }
+        SmSdfPathAttribute* pMaterial = SM_CAST_PTR(SmSdfPathAttribute, sFaces[iFace]->FindAttribute(SM_AI_MATERIAL_BINDING));
+        if (pMaterial)
+        {
+            const auto sFound = sSubsetOfMaterial.emplace(pMaterial, sSubsets.size());
+            if (sFound.second)
+            {
+                sMaterials.push_back(pMaterial);
+                sSubsets.emplace_back();
+            }
+            sSubsets[sFound.first->second].push_back(static_cast<int>(tt));
+        }
+    }
+
+    rResult.m_sExtent = std::move(sExtent);
+    rResult.m_sPoints = std::move(sPoints);
+    rResult.m_sFaceVertexCounts = std::move(sCounts);
+    rResult.m_sFaceVertexIndices = std::move(sIndices);
+    rResult.m_sNormals = std::move(sNormals);
+    rResult.m_sNormalsIndices = std::move(sNormalIndices);
+    rResult.m_sNormalsInterpolation = pxr::UsdGeomTokens->faceVarying;
+    rResult.m_sSubdivisionScheme = pxr::UsdGeomTokens->none;
+    rResult.m_sSubsetIndices.clear();
+    rResult.m_sSubsetMaterialPaths.clear();
+    for (size_t ii = 0; ii < sSubsets.size(); ++ii)
+    {
+        rResult.m_sSubsetIndices.push_back(pxr::VtIntArray(sSubsets[ii].begin(), sSubsets[ii].end()));
+        const pxr::SdfPathVector* pPaths = sMaterials[ii]->GetMaterialPaths();
+        rResult.m_sSubsetMaterialPaths.push_back(pPaths && !pPaths->empty() ? pPaths->front() : pxr::SdfPath());
+    }
+    return SM_SUCCESS;
+}
+
+// The mesh part of one SmApiUsdTessellateBrepArray result, through SmApiTessellateFast, with the same
+// partial-mesh policy, failed faces, statuses and messages as the SmApiTessellate path.
+static void sm_TessellateFast(const SmBrep& crBrep, const SmTessellationParams& crParams, const std::string& crIndex,
+                              SmApiUsdTessellatedBrep& rResult)
+{
+    SmFastTessellation sMesh;
+    const SmStatus tessStatus = SmApiTessellateFast(&crBrep, sMesh, crParams, TRUE, TRUE);
+    for (ULONG ii = 0; ii < sMesh.sFaceKinds.GetSize(); ++ii)
+        if (sMesh.sFaceKinds[ii] == SM_FAST_FACE_FAILED)
+            rResult.m_sFailedFaces.push_back(static_cast<int>(ii));
+    if (tessStatus != SM_SUCCESS)
+    {
+        rResult.m_sStatus = tessStatus;
+        rResult.m_sMessage = "Tessellation failed on Brep " + crIndex;
+        return;
+    }
+    const SmStatus meshStatus = sm_GetFastMeshData(crBrep, sMesh, rResult);
+    if (meshStatus != SM_SUCCESS)
+    {
+        rResult.m_sPoints.clear();
+        rResult.m_sFaceVertexCounts.clear();
+        rResult.m_sFaceVertexIndices.clear();
+        rResult.m_sStatus = meshStatus;
+        rResult.m_sMessage = "GetMeshData failed on Brep " + crIndex;
+        return;
+    }
+    rResult.m_sStatus = SM_SUCCESS;
+}
 
 SmStatus SmApiUsdTessellateBrepArray
 (
@@ -53,12 +192,34 @@ SmStatus SmApiUsdTessellateBrepArray
     std::vector<SmApiUsdTessellatedBrep> & rResults
 )
 {
+    return SmApiUsdTessellateBrepArray(crBrepArray, crParams, bHealerIsEnabled, dBoundaryAngleTolDeg,
+                                       SM_API_USD_TESSELLATOR_DEFAULT, rResults);
+}
+
+SmStatus SmApiUsdTessellateBrepArray
+(
+    const pxr::UsdPrim                   & crBrepArray,
+    const SmTessellationParams           & crParams,
+    SmBoolean                              bHealerIsEnabled,
+    double                                 dBoundaryAngleTolDeg,
+    SmApiUsdTessellator                    eTessellator,
+    std::vector<SmApiUsdTessellatedBrep> & rResults
+)
+{
     rResults.clear();
     auto failAll = [&](const std::string& sMessage)
     {
         rResults.emplace_back().m_sMessage = sMessage + crBrepArray.GetPath().GetString();
         return SM_ERR;
     };
+
+    if (eTessellator == SM_API_USD_TESSELLATOR_DEFAULT)
+        eTessellator = SmApiUsdGetDefaultTessellator();
+    if (eTessellator != SM_API_USD_TESSELLATOR_SMLIB && eTessellator != SM_API_USD_TESSELLATOR_FAST)
+    {
+        failAll("invalid tessellator for ");
+        return SM_ERR_INVALID_INPUT;
+    }
 
     const pxr::UsdGeomGprim gprim(crBrepArray);
     if (!gprim)
@@ -100,6 +261,12 @@ SmStatus SmApiUsdTessellateBrepArray
             rResult.m_sBoundaryStatus = SMU_BrepConvert::GetBoundaryData(pBrep, dBoundaryAngleTolDeg,
                                                                          rResult.m_sBoundaryPoints,
                                                                          rResult.m_sBoundaryVertexCounts);
+
+        if (eTessellator == SM_API_USD_TESSELLATOR_FAST)
+        {
+            sm_TessellateFast(*pBrep, crParams, sIndex, rResult);
+            continue;
+        }
 
         SmPolyBrep* pMesh = nullptr;
         SmTArray<SmTessellationFailure> sFailures;

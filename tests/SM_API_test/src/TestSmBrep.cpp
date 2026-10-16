@@ -33,6 +33,8 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <map>
+#include <vector>
 
 //*************************************************************************
 // 
@@ -1345,12 +1347,200 @@ static SmStatus TestSmTessellateParams()
                : SM_ERR;
 }
 
+// Invariants of an SmApiTessellateFast mesh of a closed brep with lFaces faces, none failed: array
+// sizes, indices, unit normals, face ids, and every edge used once in each direction (watertight).
+static SmStatus CheckFastTessellation(const SmFastTessellation& crMesh, ULONG lFaces, SmBoolean bCornerNormals)
+{
+    const ULONG lVertices = crMesh.sPoints.GetSize() / 3;
+    const ULONG lTriangles = crMesh.sTriangles.GetSize() / 3;
+    if (lTriangles == 0 || crMesh.sPoints.GetSize() != 3 * lVertices || crMesh.sTriangles.GetSize() != 3 * lTriangles ||
+        crMesh.sNormals.GetSize() != 3 * lVertices || crMesh.sTriangleFaces.GetSize() != lTriangles ||
+        crMesh.sCornerNormals.GetSize() != (bCornerNormals ? 9 * lTriangles : 0) ||
+        crMesh.sFaceKinds.GetSize() != lFaces || crMesh.lFailedFaces != 0 ||
+        crMesh.lFastFaces + crMesh.lFallbackFaces != lFaces)
+        return SM_ERR;
+    auto unit = [](const float* pVector)
+    {
+        const double dLength = std::sqrt(double(pVector[0]) * pVector[0] + double(pVector[1]) * pVector[1] +
+                                         double(pVector[2]) * pVector[2]);
+        return std::isfinite(dLength) && std::fabs(dLength - 1.0) < 1e-5;
+    };
+    for (ULONG ii = 0; ii < lVertices; ++ii)
+        if (!unit(&crMesh.sNormals[3 * ii]))
+            return SM_ERR;
+    for (ULONG ii = 0; ii < crMesh.sCornerNormals.GetSize(); ii += 3)
+        if (!unit(&crMesh.sCornerNormals[ii]))
+            return SM_ERR;
+    std::vector<ULONG> sFaceTriangles(lFaces, 0);
+    std::vector<char> sUsed(lVertices, 0);
+    std::map<std::pair<int, int>, int> sEdges;
+    for (ULONG tt = 0; tt < lTriangles; ++tt)
+    {
+        const int iFace = crMesh.sTriangleFaces[tt];
+        if (iFace < 0 || ULONG(iFace) >= lFaces || crMesh.sFaceKinds[iFace] == SM_FAST_FACE_FAILED)
+            return SM_ERR;
+        ++sFaceTriangles[iFace];
+        const int* pCorners = &crMesh.sTriangles[3 * tt];
+        for (int cc = 0; cc < 3; ++cc)
+        {
+            if (pCorners[cc] < 0 || ULONG(pCorners[cc]) >= lVertices || pCorners[cc] == pCorners[(cc + 1) % 3])
+                return SM_ERR;
+            sUsed[pCorners[cc]] = 1;
+            ++sEdges[{ pCorners[cc], pCorners[(cc + 1) % 3] }];
+        }
+    }
+    for (ULONG ii = 0; ii < lFaces; ++ii)
+        if (sFaceTriangles[ii] == 0)
+            return SM_ERR;
+    for (char bUsed : sUsed)
+        if (!bUsed)
+            return SM_ERR;
+    for (const auto& crEdge : sEdges)
+    {
+        const auto sOpposite = sEdges.find({ crEdge.first.second, crEdge.first.first });
+        if (crEdge.second != 1 || sOpposite == sEdges.end() || sOpposite->second != 1)
+            return SM_ERR;
+    }
+    return SM_SUCCESS;
+}
+
+static SmBoolean SameFastTessellation(const SmFastTessellation& crA, const SmFastTessellation& crB)
+{
+    return crA.sPoints == crB.sPoints && crA.sNormals == crB.sNormals && crA.sTriangles == crB.sTriangles &&
+           crA.sTriangleFaces == crB.sTriangleFaces && crA.sCornerNormals == crB.sCornerNormals &&
+           crA.sFaceKinds == crB.sFaceKinds;
+}
+
+static SmStatus TestSmTessellateFast()
+{
+    SmVector3d origin(0.0, 0.0, 0.0);
+    SmBrep* box = nullptr;
+    SER(SmApiCreateBox(origin, 10.0, 20.0, 30.0, box));
+    std::unique_ptr<SmBrep> ownedBox(box);
+    SmBrep* sphere = nullptr;
+    SER(SmApiCreateSphere(origin, 5.0, sphere));
+    std::unique_ptr<SmBrep> ownedSphere(sphere);
+    SmBrep* filleted = nullptr;
+    SER(SmApiCreateBox(origin, 5.0, 10.0, 15.0, filleted));
+    std::unique_ptr<SmBrep> ownedFilleted(filleted);
+    SER(SmApiCircularFillet(filleted, 0.5));
+
+    // A box: each face is two triangles, the corner normals are the face normals.
+    SmFastTessellation mesh;
+    SER(SmApiTessellateFast(box, mesh, SmTessellationParams(), FALSE, TRUE));
+    SER(CheckFastTessellation(mesh, 6, TRUE));
+    if (mesh.sTriangles.GetSize() != 36 || mesh.sPoints.GetSize() != 24)
+        return SM_ERR;
+    for (ULONG tt = 0; tt < 12; ++tt)
+    {
+        const int* pCorners = &mesh.sTriangles[3 * tt];
+        SmVector3d sPoint[3];
+        for (int cc = 0; cc < 3; ++cc)
+            sPoint[cc] = SmVector3d(mesh.sPoints[3 * pCorners[cc]], mesh.sPoints[3 * pCorners[cc] + 1], mesh.sPoints[3 * pCorners[cc] + 2]);
+        SmVector3d sNormal = (sPoint[1] - sPoint[0]) * (sPoint[2] - sPoint[0]);
+        SER(sNormal.Unitize());
+        for (int cc = 0; cc < 3; ++cc)
+        {
+            const float* pCorner = &mesh.sCornerNormals[9 * tt + 3 * cc];
+            if ((SmVector3d(pCorner[0], pCorner[1], pCorner[2]) - sNormal).Length() > 1e-6)
+                return SM_ERR;  // misoriented triangle, or a corner normal of another face
+        }
+    }
+
+    // A sphere (poles and a seam) and a filleted box: watertight, normals along the sphere's radius.
+    SER(SmApiTessellateFast(sphere, mesh, SmTessellationParams(), FALSE, TRUE));
+    SER(CheckFastTessellation(mesh, sphere->GetNumFaces(), TRUE));
+    for (ULONG ii = 0; ii < mesh.sPoints.GetSize() / 3; ++ii)
+    {
+        const SmVector3d sPoint(mesh.sPoints[3 * ii], mesh.sPoints[3 * ii + 1], mesh.sPoints[3 * ii + 2]);
+        const SmVector3d sNormal(mesh.sNormals[3 * ii], mesh.sNormals[3 * ii + 1], mesh.sNormals[3 * ii + 2]);
+        if (std::fabs(sPoint.Length() - 5.0) > 1e-9 || (sPoint / 5.0 - sNormal).Length() > 1e-5)
+            return SM_ERR;
+    }
+    SmFastTessellation again;
+    SER(SmApiTessellateFast(filleted, mesh));
+    SER(CheckFastTessellation(mesh, filleted->GetNumFaces(), FALSE));
+    SER(SmApiTessellateFast(filleted, again));
+    if (!SameFastTessellation(mesh, again))
+        return SM_ERR;  // not deterministic
+
+    // The quality controls reach the kernel: finer angles, and a negative maximum edge length is the
+    // same model-relative cap as SmApiTessellate's.
+    SmFastTessellation coarse, fine;
+    SER(SmApiTessellateFast(sphere, coarse));
+    SmTessellationParams sFine;
+    sFine.dSurfaceAngleTolDeg = 10.0;
+    SER(SmApiTessellateFast(sphere, fine, sFine));
+    if (fine.sTriangles.GetSize() <= coarse.sTriangles.GetSize())
+        return SM_ERR;
+    SmTessellationParams sRelative, sAbsolute;
+    sRelative.dMaxEdgeLength = -4.0;
+    sAbsolute.dMaxEdgeLength = 0.1 * std::sqrt(1400.0);  // 10% of the box diagonal
+    SER(SmApiTessellateFast(box, coarse, sRelative));
+    SER(SmApiTessellateFast(box, fine, sAbsolute));
+    SER(CheckFastTessellation(coarse, 6, FALSE));
+    // Only algebraically equal caps (the relative one comes from the bounding box): same
+    // triangles, points within a small tolerance.
+    if (coarse.sTriangles.GetSize() <= 36 || !(coarse.sTriangles == fine.sTriangles) ||
+        coarse.sPoints.GetSize() != fine.sPoints.GetSize())
+        return SM_ERR;
+    for (ULONG ii = 0; ii < coarse.sPoints.GetSize(); ++ii)
+        if (std::fabs(coarse.sPoints[ii] - fine.sPoints[ii]) > 1e-9)
+            return SM_ERR;
+
+    // A face whose trim curves leave its surface's domain fails: rejected unless partial output is
+    // allowed, with the face kinds kept either way.
+    SER(box->TurnToNURBS());
+    SmTArray<SmFace*> faces;
+    box->GetFaces(faces);
+    SmTArray<SmEdgeuse*> edgeuses;
+    faces[3]->GetUpwardFaceuse()->GetEdgeuses(edgeuses);
+    SmAxis2Placement shift(SmPoint3d(1000, 1000, 0), SmVector3d(1, 0, 0), SmVector3d(0, 1, 0));
+    for (SmEdgeuse* edgeuse : edgeuses)
+    {
+        SmBSplineCurve* uv = nullptr;
+        SER(edgeuse->GetOrCreateUVTrimCurve(uv));
+        SER(uv->Transform(shift));
+    }
+    for (SmBoolean bAllowPartial : { FALSE, TRUE })
+    {
+        const SmStatus status = SmApiTessellateFast(box, mesh, SmTessellationParams(), bAllowPartial);
+        if ((status == SM_SUCCESS) != bool(bAllowPartial) || mesh.sFaceKinds.GetSize() != 6 || mesh.lFailedFaces != 1 ||
+            mesh.sFaceKinds[3] != SM_FAST_FACE_FAILED || mesh.sTriangles.GetSize() != (bAllowPartial ? 30u : 0u))
+            return SM_ERR;
+        for (ULONG tt = 0; tt < mesh.sTriangleFaces.GetSize(); ++tt)
+            if (mesh.sTriangleFaces[tt] == 3)
+                return SM_ERR;
+    }
+    // Every face failing leaves no mesh, even with partial output allowed, as in SmApiTessellate.
+    for (SmFace* face : faces)
+    {
+        if (face == faces[3])
+            continue;
+        edgeuses.RemoveAll();
+        face->GetUpwardFaceuse()->GetEdgeuses(edgeuses);
+        for (SmEdgeuse* edgeuse : edgeuses)
+        {
+            SmBSplineCurve* uv = nullptr;
+            SER(edgeuse->GetOrCreateUVTrimCurve(uv));
+            SER(uv->Transform(shift));
+        }
+    }
+    if (SmApiTessellateFast(box, mesh, SmTessellationParams(), TRUE) == SM_SUCCESS || mesh.lFailedFaces != 6 ||
+        !mesh.sPoints.IsEmpty() || !mesh.sTriangles.IsEmpty())
+        return SM_ERR;
+    if (SmApiTessellateFast(nullptr, mesh) == SM_SUCCESS || !mesh.sPoints.IsEmpty() || !mesh.sFaceKinds.IsEmpty())
+        return SM_ERR;
+    return SM_SUCCESS;
+}
+
 SmStatus TestSmTessellate()
 {
     SER(TestSmTessellateFailures());
     SER(TestSmTessellateMaxEdgeCap());
     SER(TestSmTessellateParams());
     SER(TestSmTessellateBoundaries());
+    SER(TestSmTessellateFast());
 
     SmApiCreateContext();
 

@@ -28,16 +28,22 @@
 #include <pxr/usd/usd/attribute.h>
 #include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usd/stage.h>
+#include <pxr/usd/usdGeom/subset.h>
 #include <pxr/usd/usdGeom/xformable.h>
+#include <pxr/usd/usdShade/material.h>
+#include <pxr/usd/usdShade/materialBindingAPI.h>
 
 // Load kernel declarations before Windows macros introduced by USD.
 #include <UsdBrepHeaders.h>
 #include <SmuTessellate.h>
 #include <SmuAttribute.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <future>
 #include <memory>
+#include <set>
 #include <vector>
 #include <cstdio>
 #include <string>
@@ -514,7 +520,17 @@ static SmStatus CheckTessellatedBrep(const SmApiUsdTessellatedBrep& rMesh)
     return SM_SUCCESS;
 }
 
-static SmStatus TestTessellateBrepArray()
+// SmApiUsdTessellateBrepArray with the default quality, through the original overload for the default
+// tessellator so that it stays tested.
+static SmStatus TessellateBrepArray(const pxr::UsdPrim& rPrim, double dBoundaryAngleTolDeg, SmApiUsdTessellator eTessellator,
+                                    std::vector<SmApiUsdTessellatedBrep>& rResults)
+{
+    if (eTessellator == SM_API_USD_TESSELLATOR_DEFAULT)
+        return SmApiUsdTessellateBrepArray(rPrim, SmTessellationParams(), FALSE, dBoundaryAngleTolDeg, rResults);
+    return SmApiUsdTessellateBrepArray(rPrim, SmTessellationParams(), FALSE, dBoundaryAngleTolDeg, eTessellator, rResults);
+}
+
+static SmStatus TestTessellateBrepArray(SmApiUsdTessellator eTessellator)
 {
     // Two boxes in one BrepArray.
     std::vector<SmBrep*> boxes;
@@ -543,7 +559,7 @@ static SmStatus TestTessellateBrepArray()
 
     // One result per member, in order, with mesh and edges.
     std::vector<SmApiUsdTessellatedBrep> results;
-    SER(SmApiUsdTessellateBrepArray(prim, SmTessellationParams(), FALSE, 5.0, results));
+    SER(TessellateBrepArray(prim, 5.0, eTessellator, results));
     if (results.size() != 2)
         return SM_ERR;
     for (size_t ii = 0; ii < results.size(); ++ii)
@@ -564,7 +580,7 @@ static SmStatus TestTessellateBrepArray()
             for (int iIteration = 0; iIteration < 8; ++iIteration)
             {
                 std::vector<SmApiUsdTessellatedBrep> concurrent;
-                if (SmApiUsdTessellateBrepArray(prim, SmTessellationParams(), FALSE, 5.0, concurrent) != SM_SUCCESS
+                if (TessellateBrepArray(prim, 5.0, eTessellator, concurrent) != SM_SUCCESS
                     || concurrent.size() != results.size())
                     return SM_ERR;
                 for (size_t ii = 0; ii < results.size(); ++ii)
@@ -582,7 +598,7 @@ static SmStatus TestTessellateBrepArray()
     SER(concurrentStatus);
 
     // A zero boundary angle skips edge sampling but still meshes.
-    SER(SmApiUsdTessellateBrepArray(prim, SmTessellationParams(), FALSE, 0.0, results));
+    SER(TessellateBrepArray(prim, 0.0, eTessellator, results));
     if (results.size() != 2 || !results[0].m_sBoundaryPoints.empty())
         return SM_ERR;
     SER(CheckTessellatedBrep(results[0]));
@@ -613,7 +629,7 @@ static SmStatus TestTessellateBrepArray()
         || !author("weights", pxr::SdfValueTypeNames->DoubleArray, pxr::VtValue(pxr::VtArray<double>(8, 1.0)))
         || !author("controlVertices", pxr::SdfValueTypeNames->Double2Array, pxr::VtValue(controlVertices)))
         return SM_ERR;
-    SER(SmApiUsdTessellateBrepArray(partialPrim, SmTessellationParams(), FALSE, 5.0, results));
+    SER(TessellateBrepArray(partialPrim, 5.0, eTessellator, results));
     if (results.size() != 1 || CheckTessellatedBrep(results[0]) != SM_SUCCESS || results[0].m_sBoundaryPoints.empty())
         return SM_ERR;
     if (results[0].m_sFailedFaces.size() != 1 || results[0].m_sFailedFaces[0] != 0)
@@ -628,8 +644,7 @@ static SmStatus TestTessellateBrepArray()
     pxr::UsdStageRefPtr mixedStage = pxr::UsdStage::Open(sMixedFilename);
     if (!mixedStage)
         return SM_ERR;
-    SER(SmApiUsdTessellateBrepArray(mixedStage->GetPrimAtPath(pxr::SdfPath("/World/Brep0")), SmTessellationParams(), FALSE,
-                                    5.0, results));
+    SER(TessellateBrepArray(mixedStage->GetPrimAtPath(pxr::SdfPath("/World/Brep0")), 5.0, eTessellator, results));
     if (results.size() != 3 || CheckTessellatedBrep(results[0]) != SM_SUCCESS || CheckTessellatedBrep(results[2]) != SM_SUCCESS)
         return SM_ERR;
     if (results[1].m_iPackedBrepIndex != 1 || results[1].m_sStatus == SM_SUCCESS || !results[1].m_sPoints.empty()
@@ -642,12 +657,162 @@ static SmStatus TestTessellateBrepArray()
     pxr::UsdStageRefPtr emptyStage = pxr::UsdStage::Open(sEmptyFilename);
     if (!emptyStage)
         return SM_ERR;
-    if (SmApiUsdTessellateBrepArray(emptyStage->GetPrimAtPath(pxr::SdfPath("/World/Brep0")), SmTessellationParams(), FALSE,
-                                    5.0, results) == SM_SUCCESS)
+    if (TessellateBrepArray(emptyStage->GetPrimAtPath(pxr::SdfPath("/World/Brep0")), 5.0, eTessellator, results) == SM_SUCCESS)
         return SM_ERR;
     if (results.size() != 1 || results[0].m_iPackedBrepIndex >= 0 || results[0].m_sMessage.empty())
         return SM_ERR;
 
+    return SM_SUCCESS;
+}
+
+//*************************************************************************
+// TestTessellateBrepArrayFast
+//   The tessellator switch, and SM_API_USD_TESSELLATOR_FAST filling the
+//   results with SM_API_USD_TESSELLATOR_SMLIB's conventions.
+//*************************************************************************
+
+// Area and bounding box of the triangles of a GeomSubset.
+static void SubsetAreaAndBox(const SmApiUsdTessellatedBrep& rMesh, const pxr::VtIntArray& rSubset, double& rArea, SmExtent3d& rBox)
+{
+    rArea = 0.0;
+    rBox = SmExtent3d();
+    for (int iFace : rSubset)
+    {
+        SmPoint3d sCorner[3];
+        for (int cc = 0; cc < 3; ++cc)
+        {
+            const pxr::GfVec3f& rPoint = rMesh.m_sPoints[rMesh.m_sFaceVertexIndices[3 * iFace + cc]];
+            sCorner[cc] = SmPoint3d(rPoint[0], rPoint[1], rPoint[2]);
+            rBox.AddPoint3d(sCorner[cc]);
+        }
+        rArea += 0.5 * ((sCorner[1] - sCorner[0]) * (sCorner[2] - sCorner[0])).Length();
+    }
+}
+
+static SmStatus TestTessellateBrepArrayFast()
+{
+    const char* pSwitch = std::getenv("SMLIB_FAST_TESSELLATION");
+    const SmApiUsdTessellator eDefault = (pSwitch && std::string(pSwitch) == "1") ? SM_API_USD_TESSELLATOR_FAST
+                                                                                    : SM_API_USD_TESSELLATOR_SMLIB;
+    if (SmApiUsdGetDefaultTessellator() != eDefault || SmApiUsdGetDefaultTessellator() != eDefault)
+        return SM_ERR;
+
+    // A cylinder with one material on its side face and another on its caps.
+    SmBrep* pCylinder = NULL;
+    SmVector3d sOrigin(0.0, 0.0, 0.0);
+    SER(SmApiCreateCylinder(sOrigin, 5.0, 10.0, pCylinder));
+    const std::string sFilename = kOutputDir + "test_tessellate_brep_array_fast.usda";
+    SmStatus stat = SmApiUsdExportBrep(sFilename.c_str(), pCylinder, FALSE);
+    delete pCylinder;
+    SER(stat);
+    pxr::UsdStageRefPtr stage = pxr::UsdStage::Open(sFilename);
+    if (!stage)
+        return SM_ERR;
+    const pxr::UsdPrim prim = stage->GetPrimAtPath(pxr::SdfPath("/World/Brep0"));
+    const pxr::SdfPath side("/World/Looks/Side"), caps("/World/Looks/Caps");
+    const std::pair<pxr::SdfPath, pxr::VtIntArray> bindings[2] = { { side, { 0 } }, { caps, { 1, 2 } } };
+    for (const auto& rBinding : bindings)
+    {
+        const pxr::UsdShadeMaterial material = pxr::UsdShadeMaterial::Define(stage, rBinding.first);
+        pxr::UsdGeomSubset subset = pxr::UsdGeomSubset::Define(stage, prim.GetPath().AppendChild(rBinding.first.GetNameToken()));
+        if (!subset.GetElementTypeAttr().Set(pxr::UsdGeomTokens->face) || !subset.GetIndicesAttr().Set(rBinding.second)
+            || !subset.GetFamilyNameAttr().Set(pxr::TfToken("materialBind"))
+            || !pxr::UsdShadeMaterialBindingAPI::Apply(subset.GetPrim()).Bind(material))
+            return SM_ERR;
+    }
+    stage->Save();
+
+    std::vector<SmApiUsdTessellatedBrep> smlib, fast;
+    SER(SmApiUsdTessellateBrepArray(prim, SmTessellationParams(), FALSE, 5.0, SM_API_USD_TESSELLATOR_SMLIB, smlib));
+    SER(SmApiUsdTessellateBrepArray(prim, SmTessellationParams(), FALSE, 5.0, SM_API_USD_TESSELLATOR_FAST, fast));
+    if (smlib.size() != 1 || fast.size() != 1)
+        return SM_ERR;
+    SER(CheckTessellatedBrep(smlib[0]));
+    SER(CheckTessellatedBrep(fast[0]));
+    const SmApiUsdTessellatedBrep& rSmlib = smlib[0];
+    const SmApiUsdTessellatedBrep& rFast = fast[0];
+    // Everything but the mesh is the same; the mesh is another tessellation of the same surfaces.
+    if (rFast.m_iPackedBrepIndex != rSmlib.m_iPackedBrepIndex || rFast.m_sStatus != rSmlib.m_sStatus
+        || rFast.m_sMessage != rSmlib.m_sMessage || rFast.m_sFailedFaces != rSmlib.m_sFailedFaces
+        || rFast.m_sBoundaryStatus != rSmlib.m_sBoundaryStatus || rFast.m_sBoundaryPoints != rSmlib.m_sBoundaryPoints
+        || rFast.m_sBoundaryVertexCounts != rSmlib.m_sBoundaryVertexCounts
+        || rFast.m_sNormalsInterpolation != rSmlib.m_sNormalsInterpolation
+        || rFast.m_sNormalsInterpolation != pxr::UsdGeomTokens->faceVarying
+        || rFast.m_sSubdivisionScheme != rSmlib.m_sSubdivisionScheme || rFast.m_sMaterialPath != rSmlib.m_sMaterialPath
+        || rFast.m_sExtent.size() != 2 || rSmlib.m_sExtent.size() != 2
+        || rFast.m_sSubsetIndices.size() != 2 || rSmlib.m_sSubsetIndices.size() != 2
+        || rFast.m_sSubsetMaterialPaths.size() != 2 || rSmlib.m_sSubsetMaterialPaths.size() != 2)
+        return SM_ERR;
+    for (int ii = 0; ii < 2; ++ii)
+        if ((rFast.m_sExtent[ii] - rSmlib.m_sExtent[ii]).GetLength() > 1e-4f)
+            return SM_ERR;
+    // The same material subsets, in any order, covering every triangle once and the same surfaces.
+    for (const pxr::SdfPath& rMaterial : { side, caps })
+    {
+        const auto inFast = std::find(rFast.m_sSubsetMaterialPaths.begin(), rFast.m_sSubsetMaterialPaths.end(), rMaterial);
+        const auto inSmlib = std::find(rSmlib.m_sSubsetMaterialPaths.begin(), rSmlib.m_sSubsetMaterialPaths.end(), rMaterial);
+        if (inFast == rFast.m_sSubsetMaterialPaths.end() || inSmlib == rSmlib.m_sSubsetMaterialPaths.end())
+            return SM_ERR;
+        double dFastArea = 0.0, dSmlibArea = 0.0;
+        SmExtent3d sFastBox, sSmlibBox;
+        SubsetAreaAndBox(rFast, rFast.m_sSubsetIndices[inFast - rFast.m_sSubsetMaterialPaths.begin()], dFastArea, sFastBox);
+        SubsetAreaAndBox(rSmlib, rSmlib.m_sSubsetIndices[inSmlib - rSmlib.m_sSubsetMaterialPaths.begin()], dSmlibArea, sSmlibBox);
+        if (std::abs(dFastArea - dSmlibArea) > 0.05 * dSmlibArea || (sFastBox.GetMin() - sSmlibBox.GetMin()).Length() > 1e-4
+            || (sFastBox.GetMax() - sSmlibBox.GetMax()).Length() > 1e-4)
+            return SM_ERR;
+    }
+    std::vector<int> sCovered(rFast.m_sFaceVertexCounts.size(), 0);
+    for (const pxr::VtIntArray& rSubset : rFast.m_sSubsetIndices)
+        for (int iFace : rSubset)
+            if (iFace < 0 || static_cast<size_t>(iFace) >= sCovered.size() || sCovered[iFace]++)
+                return SM_ERR;
+    if (std::find(sCovered.begin(), sCovered.end(), 0) != sCovered.end())
+        return SM_ERR;
+
+    // The fast mesh is SmApiTessellateFast's mesh of the same Brep, with one normal per vertex and face.
+    std::vector<SmBrep*> imported;
+    SER(SmApiUsdImportBreps(sFilename.c_str(), imported, FALSE));
+    std::unique_ptr<SmBrep> pImported(imported.size() == 1 ? imported[0] : nullptr);
+    if (!pImported)
+    {
+        DeleteImportedBreps(imported);
+        return SM_ERR;
+    }
+    SmFastTessellation sMesh;
+    SER(SmApiTessellateFast(pImported.get(), sMesh, SmTessellationParams(), FALSE, TRUE));
+    if (rFast.m_sPoints.size() != sMesh.sPoints.GetSize() / 3 || rFast.m_sFaceVertexIndices.size() != sMesh.sTriangles.GetSize())
+        return SM_ERR;
+    for (size_t ii = 0; ii < rFast.m_sPoints.size(); ++ii)
+        if (rFast.m_sPoints[ii] != pxr::GfVec3f(static_cast<float>(sMesh.sPoints[3 * ii]), static_cast<float>(sMesh.sPoints[3 * ii + 1]),
+                                                static_cast<float>(sMesh.sPoints[3 * ii + 2])))
+            return SM_ERR;
+    std::set<std::pair<int, int>> sVertexFaces;
+    std::vector<char> sNormalUsed(rFast.m_sNormals.size(), 0);
+    for (size_t cc = 0; cc < rFast.m_sFaceVertexIndices.size(); ++cc)
+    {
+        const int iFace = sMesh.sTriangleFaces[cc / 3];
+        pxr::GfVec3f sCornerNormal(sMesh.sCornerNormals[3 * cc], sMesh.sCornerNormals[3 * cc + 1], sMesh.sCornerNormals[3 * cc + 2]);
+        sCornerNormal.Normalize();
+        if (rFast.m_sFaceVertexIndices[cc] != sMesh.sTriangles[cc] || rFast.m_sNormals[rFast.m_sNormalsIndices[cc]] != sCornerNormal)
+            return SM_ERR;
+        sVertexFaces.emplace(sMesh.sTriangles[cc], iFace);
+        sNormalUsed[rFast.m_sNormalsIndices[cc]] = 1;
+        // The subset of a triangle is the one of its face's material.
+        const pxr::SdfPath& rMaterial = (iFace == 0) ? side : caps;
+        const auto inFast = std::find(rFast.m_sSubsetMaterialPaths.begin(), rFast.m_sSubsetMaterialPaths.end(), rMaterial);
+        const pxr::VtIntArray& rSubset = rFast.m_sSubsetIndices[inFast - rFast.m_sSubsetMaterialPaths.begin()];
+        if (std::find(rSubset.begin(), rSubset.end(), static_cast<int>(cc / 3)) == rSubset.end())
+            return SM_ERR;
+    }
+    // One normal per vertex and face here (a cylinder has no corners with differing normals), all used.
+    if (rFast.m_sNormals.size() != sVertexFaces.size() || std::find(sNormalUsed.begin(), sNormalUsed.end(), 0) != sNormalUsed.end())
+        return SM_ERR;
+
+    // An invalid tessellator is rejected with one whole-prim result.
+    if (SmApiUsdTessellateBrepArray(prim, SmTessellationParams(), FALSE, 5.0, static_cast<SmApiUsdTessellator>(7), fast)
+            != SM_ERR_INVALID_INPUT
+        || fast.size() != 1 || fast[0].m_iPackedBrepIndex >= 0 || fast[0].m_sMessage.empty())
+        return SM_ERR;
     return SM_SUCCESS;
 }
 
@@ -664,7 +829,9 @@ SmStatus TestSmApiUsdExportBrep()
     SER(TestSubsetIndicesSkipLooplessFaces());
     SER(TestSourceOwnedMaterialFallback());
     SER(TestEmptyMeshExtraction());
-    SER(TestTessellateBrepArray());
+    SER(TestTessellateBrepArray(SM_API_USD_TESSELLATOR_DEFAULT));
+    SER(TestTessellateBrepArray(SM_API_USD_TESSELLATOR_FAST));
+    SER(TestTessellateBrepArrayFast());
 
     SmVector3d sPosition(0.0, 0.0, 0.0);
     SmBrep* pSphere = NULL;

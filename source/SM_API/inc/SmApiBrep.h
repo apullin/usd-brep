@@ -131,6 +131,45 @@ SMAPI_EXPORT SmApiStatus SmApiTessellate(
     SmTessellationReport* pReport = nullptr ///< [out]: Nonfatal output topology diagnostics
 );
 
+/// How SmApiTessellateFast tessellated a face.
+enum SmFastFaceKind
+{
+  SM_FAST_FACE_FAILED   = 0,  ///< No triangles: the face could not be tessellated
+  SM_FAST_FACE_FAST     = 1,  ///< Triangulated by a fast triangulator
+  SM_FAST_FACE_FALLBACK = 2   ///< Triangulated by SMLib's own face triangulation, as in SmApiTessellate
+};
+
+/// SmApiTessellateFast output: one indexed triangle mesh for the whole Brep, in flat arrays.
+/// Faces share the vertices of the edges between them, as in SmApiTessellate's mesh.
+/// Indices are 0-based; face indices are input GetFaces() indices.
+struct SmFastTessellation
+{
+  SmTArray<double>         sPoints;         ///< 3 per vertex
+  SmTArray<float>          sNormals;        ///< 3 per vertex: unit sum of the vertex's face normals
+  SmTArray<int>            sTriangles;      ///< 3 vertex indices per triangle, counterclockwise seen from outside
+  SmTArray<int>            sTriangleFaces;  ///< Per triangle: index of its face
+  SmTArray<float>          sCornerNormals;  ///< 9 per triangle when requested: unit normal of its face at each corner
+  SmTArray<SmFastFaceKind> sFaceKinds;      ///< Per face: how it was tessellated
+  ULONG                    lFastFaces     = 0;  ///< Faces with SM_FAST_FACE_FAST
+  ULONG                    lFallbackFaces = 0;  ///< Faces with SM_FAST_FACE_FALLBACK
+  ULONG                    lFailedFaces   = 0;  ///< Faces with SM_FAST_FACE_FAILED
+};
+
+/// Opt-in fast tessellation of a brep into flat arrays, for display. It keeps SmApiTessellate's
+/// edge tessellation and quality controls, triangulates faces in parallel, and triangulates the
+/// faces no fast triangulator handles as SmApiTessellate does. The result is deterministic at
+/// any thread count, but it is not bit-identical to SmApiTessellate's, which stays unchanged.
+/// Rejects failed faces unless bAllowPartial is TRUE, and fails without faces or when every face
+/// failed, as SmApiTessellate does. rMesh is replaced; errors leave its arrays empty, but keep
+/// sFaceKinds and the face counts when the faces were tessellated.
+SMAPI_EXPORT SmApiStatus SmApiTessellateFast(
+    const SmBrep* pBrep,                    ///< [in ]: Brep to tessellate; not modified
+    SmFastTessellation& rMesh,              ///< [out]: Resulting mesh arrays
+    const SmTessellationParams& rParams = SmTessellationParams(), ///< [in ]: Quality controls
+    SmBoolean bAllowPartial = FALSE,        ///< [in ]: Retain the other faces when some faces fail
+    SmBoolean bCornerNormals = FALSE        ///< [in ]: Also fill rMesh.sCornerNormals
+);
+
 /// Sample trimmed edges; finite, positive angle in degrees. Brep is unchanged.
 /// Replaces flat points, counts and borrowed edges.
 /// Missing/failed curves: zero counts and SM_ERR; valid samples are retained.
