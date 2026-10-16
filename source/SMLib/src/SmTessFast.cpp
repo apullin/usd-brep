@@ -671,10 +671,11 @@ SmStatus SmTriangulateRectangularFace(const SmFastFaceInput & crIn, SmFastFaceOu
   //    vertex along the same horizontal and vertical line
   std::vector<SmUVKey> sVerts;
   std::vector<int>     sCornerCount;
+  std::vector<int>     sFirstCorner;                       // the first of each vertex's leaf corners in sAll
   std::vector<int>     sLeafCorner((size_t)lLeaves * 4);   // BL, BR, TR, TL vertex of each leaf
+  struct SmCornerKey { double u, v; int lc; };
+  std::vector<SmCornerKey> sAll((size_t)lLeaves * 4);      // the leaf corners 4 l + c, sorted
     {
-      struct SmCornerKey { double u, v; int lc; };
-      std::vector<SmCornerKey> sAll((size_t)lLeaves * 4);
       for (int l = 0; l < lLeaves; l++)
         {
           const SmLeafRect & crLeaf = sLeaves[l];
@@ -688,19 +689,22 @@ SmStatus SmTriangulateRectangularFace(const SmFastFaceInput & crIn, SmFastFaceOu
       if (crIn.bParallelSafe) { sm_RunIsolated([&] { tbb::parallel_sort(sAll.begin(), sAll.end(), Less); }); }
       else                    { std::sort(sAll.begin(), sAll.end(), Less); }
       sVerts.reserve(sAll.size() / 2);
+      sCornerCount.reserve(sAll.size() / 2);
+      sFirstCorner.reserve(sAll.size() / 2);
       for (size_t i = 0; i < sAll.size(); i++)
         {
           if (sVerts.empty() || sAll[i].u != sVerts.back().u || sAll[i].v != sVerts.back().v)
             {
               sVerts.push_back({sAll[i].u, sAll[i].v});
               sCornerCount.push_back(0);
+              sFirstCorner.push_back((int)i);
             }
           sCornerCount.back()++;
           sLeafCorner[sAll[i].lc] = (int)sVerts.size() - 1;
         }
     }
   const int lVerts = (int)sVerts.size();
-  std::vector<int> sNextH(lVerts, -1), sNextV(lVerts, -1);
+  std::vector<int> sNextH(lVerts, -1), sNextV(lVerts, -1), sPrevH(lVerts, -1);
     {
       std::vector<int> sByV(lVerts);
       std::iota(sByV.begin(), sByV.end(), 0);
@@ -710,12 +714,69 @@ SmStatus SmTriangulateRectangularFace(const SmFastFaceInput & crIn, SmFastFaceOu
       for (int k = 0; k + 1 < lVerts; k++)
         {
           if (sVerts[k + 1].u == sVerts[k].u) { sNextV[k] = k + 1; }
-          if (sVerts[sByV[k + 1]].v == sVerts[sByV[k]].v) { sNextH[sByV[k]] = sByV[k + 1]; }
+          if (sVerts[sByV[k + 1]].v == sVerts[sByV[k]].v)
+            {
+              sNextH[sByV[k]]     = sByV[k + 1];
+              sPrevH[sByV[k + 1]] = sByV[k];
+            }
         }
     }
 
+  // 4. SMLib's Phase 2 ends the split of a tree node on a vertex of the node's side, made by the neighbor
+  //    across it, within a quarter of the adjacent leaves (PrepareTreeNodeData()), so the near coincident
+  //    splits of neighbor blocks become one vertex instead of a sliver. The same here: a T-junction whose
+  //    leaves lie right of or above its line (made after the line's other side in SMLib's depth first
+  //    order) merges into the next vertex on the line that is a T-junction from the other side, when that
+  //    is within a quarter of the leaf between them.
+  std::vector<int> sKeep(lVerts, -1);  // the vertex a T-junction merges into, or -1
+    {
+      auto TJunction = [&](int k, int lMask)  // an interior T-junction of the given leaf corners (bit c: corner c)
+        {
+          return    k >= 0 && sCornerCount[k] == 2
+                 && ((1 << (sAll[sFirstCorner[k]].lc & 3)) | (1 << (sAll[sFirstCorner[k] + 1].lc & 3))) == lMask
+                 && sVerts[k].u != U0 && sVerts[k].u != U1 && sVerts[k].v != V0 && sVerts[k].v != V1;
+        };
+      auto Merge = [&](int k)
+        {
+          // leaves right of a vertical line (BL of the upper leaf, TL of the lower), merging along v into
+          // a vertex whose leaves lie left of it (BR, TR); or leaves above a horizontal line (BL of the
+          // right leaf, BR of the left one), merging along u into one with leaves below it (TL, TR)
+          const SmBoolean bVertical = TJunction(k, 9) ? TRUE : FALSE;
+          if (!bVertical && !TJunction(k, 3))
+            { return; }
+          const int lOther = bVertical ? 6 : 12;
+          double dBest = std::numeric_limits<double>::infinity();
+          for (int lc = 0; lc < 2; lc++)
+            {
+              const int lCorner = sAll[sFirstCorner[k] + lc].lc;
+              const SmLeafRect & crLeaf = sLeaves[lCorner / 4];
+              // the leaf with its BL corner here lies up (right) of the vertex, the other one down (left)
+              const SmBoolean bUp = ((lCorner & 3) == 0) ? TRUE : FALSE;
+              const int    lNext   = bVertical ? (bUp ? sNextV[k] : ((k > 0 && sNextV[k - 1] == k) ? k - 1 : -1))
+                                                 : (bUp ? sNextH[k] : sPrevH[k]);
+              const double dExtent = bVertical ? crLeaf.v1 - crLeaf.v0 : crLeaf.u1 - crLeaf.u0;
+              if (!TJunction(lNext, lOther))
+                { continue; }
+              const double dDist = bVertical ? std::fabs(sVerts[lNext].v - sVerts[k].v) : std::fabs(sVerts[lNext].u - sVerts[k].u);
+              if (dDist <= 0.25 * dExtent && (dDist < dBest || (dDist == dBest && !bUp)))
+                {
+                  dBest    = dDist;
+                  sKeep[k] = lNext;
+                }
+            }
+        };
+      auto MergeRange = [&](const tbb::blocked_range<int> & crRange)
+        {
+          for (int k = crRange.begin(); k != crRange.end(); ++k)
+            { Merge(k); }
+        };
+      if (crIn.bParallelSafe && lVerts > 2048) { sm_ParallelFor(tbb::blocked_range<int>(0, lVerts, 1024), MergeRange); }
+      else                                     { MergeRange(tbb::blocked_range<int>(0, lVerts)); }
+    }
+
   // 5. polygon references of the vertices: r >= 0 new vertex r (interior), r >= lNew pole point r - lNew,
-  //    r < 0 loop vertex ~r (corners and snapped boundary points)
+  //    r < 0 loop vertex ~r (corners and snapped boundary points); a merged T-junction takes the reference
+  //    of the vertex it merges into
   std::vector<int> sRef(lVerts);
   std::vector<int> sNewVert;               // vertex index of each new vertex
   std::vector<int> sPoleVert;              // vertex index of each pole point
@@ -733,8 +794,11 @@ SmStatus SmTriangulateRectangularFace(const SmFastFaceInput & crIn, SmFastFaceOu
       const SmBoolean bOnU = (u == U0 || u == U1), bOnV = (v == V0 || v == V1);
       if (!bOnU && !bOnV)
         {
-          sRef[i] = (int)sNewVert.size();
-          sNewVert.push_back(i);
+          if (sKeep[i] < 0)
+            {
+              sRef[i] = (int)sNewVert.size();
+              sNewVert.push_back(i);
+            }
           continue;
         }
       if (bOnU && bOnV)
@@ -758,6 +822,11 @@ SmStatus SmTriangulateRectangularFace(const SmFastFaceInput & crIn, SmFastFaceOu
   const int lNew = (int)sNewVert.size();
   for (size_t p = 0; p < sPoleVert.size(); p++)
     { sRef[sPoleVert[p]] = lNew + (int)p; }
+  for (int i = 0; i < lVerts; i++)
+    {
+      if (sKeep[i] >= 0)
+        { sRef[i] = sRef[sKeep[i]]; }
+    }
 
   // SMLib meshes only the corners of leaves that don't touch the boundary, while this mesh has every
   // interior corner. Where many interior corners touch no interior leaf (small faces, thin strips of
@@ -772,6 +841,11 @@ SmStatus SmTriangulateRectangularFace(const SmFastFaceInput & crIn, SmFastFaceOu
               for (int c = 0; c < 4; c++)
                 { sTouched[sLeafCorner[4 * l + c]] = 1; }
             }
+        }
+      for (int i = 0; i < lVerts; i++)
+        {
+          if (sKeep[i] >= 0 && sTouched[i])
+            { sTouched[sKeep[i]] = 1; }  // a merged T-junction touches the vertex it merges into
         }
       int lUntouched = 0;
       for (int k = 0; k < lNew; k++)
@@ -1206,6 +1280,100 @@ SmStatus sm_CopyPhase2Triangles(SmFastFaceWork & rWork, const std::unordered_map
   return SM_SUCCESS;
 }
 
+// SmTess::OutputToPolyBrep() drops a polygon vertex closer than tolerance/100 to the next, so SMLib's output has no
+// edges that short (it skips the polygons left with fewer than 3 vertices, e.g. tree leaves thinner than that).
+// The same for a fast face: the ends of a shorter triangle edge merge (a loop vertex absorbs a new vertex; two loop
+// vertices stay, as the neighbor face has them too), and the triangles that become degenerate go.
+void sm_CollapseShortEdges(SmFastFaceOutput & rOut, const std::vector<SmPoint3d> & crLoopPoints, double dMinLength,
+                           SmBoolean bParallel)
+{
+  const size_t lNew = rOut.sNewPoints.size();
+  if (lNew == 0 || !(dMinLength > 0.0))
+    { return; }
+  const double dMin2 = dMinLength * dMinLength;
+  auto Point = [&](long r) -> const SmPoint3d & { return (r >= 0) ? crLoopPoints[r] : rOut.sNewPoints[~r]; };
+  // most faces have no such edge: look for one first, in parallel for large faces
+  auto HasShort = [&](size_t lFirst, size_t lEnd)
+    {
+      for (size_t kk = 3 * lFirst; kk < 3 * lEnd; kk += 3)
+        {
+          for (int e = 0; e < 3; e++)
+            {
+              const long a = rOut.sTriangles[kk + e], b = rOut.sTriangles[kk + (e + 1) % 3];
+              if ((a < 0 || b < 0) && a != b && Point(a).DistanceBetweenSquared(Point(b)) < dMin2)
+                { return true; }
+            }
+        }
+      return false;
+    };
+  const size_t lTriangles = rOut.sTriangles.size() / 3;
+  if (bParallel && lTriangles > 4096)
+    {
+      std::atomic<bool> sFound(false);
+      sm_ParallelFor(tbb::blocked_range<size_t>(0, lTriangles, 1024), [&](const tbb::blocked_range<size_t> & crRange)
+        {
+          if (!sFound.load(std::memory_order_relaxed) && HasShort(crRange.begin(), crRange.end()))
+            { sFound.store(true, std::memory_order_relaxed); }
+        });
+      if (!sFound.load())
+        { return; }
+    }
+  else if (!HasShort(0, lTriangles))
+    { return; }
+  std::vector<long> sParent(lNew);  // union-find over the new vertices: ~self, a loop id or another new vertex
+  for (size_t kk = 0; kk < lNew; kk++)
+    { sParent[kk] = ~(long)kk; }
+  auto Find = [&](long r)
+    {
+      while (r < 0 && sParent[~r] != r)
+        {
+          const long q = sParent[~r];
+          if (q < 0 && sParent[~q] != q) { sParent[~r] = sParent[~q]; }  // path halving
+          r = sParent[~r];
+        }
+      return r;
+    };
+  std::vector<long> & rT = rOut.sTriangles;
+  SmBoolean bMerged = FALSE;
+  for (size_t kk = 0; kk + 2 < rT.size(); kk += 3)
+    {
+      for (int e = 0; e < 3; e++)
+        {
+          const long a = rT[kk + e], b = rT[kk + (e + 1) % 3];
+          if ((a >= 0 && b >= 0) || a == b || Point(a).DistanceBetweenSquared(Point(b)) >= dMin2)
+            { continue; }
+          const long ra = Find(a), rb = Find(b);
+          if (ra == rb || (ra >= 0 && rb >= 0))
+            { continue; }
+          if      (ra >= 0)  { sParent[~rb] = ra; }  // the loop vertex represents the set
+          else if (rb >= 0)  { sParent[~ra] = rb; }
+          else if (~ra < ~rb) { sParent[~rb] = ra; }  // else the lowest new vertex
+          else               { sParent[~ra] = rb; }
+          bMerged = TRUE;
+        }
+    }
+  if (!bMerged)
+    { return; }
+  const SmBoolean bUVs = (rOut.sTriangleUVs.size() == rT.size()) ? TRUE : FALSE;
+  size_t lOut = 0;
+  for (size_t kk = 0; kk + 2 < rT.size(); kk += 3)
+    {
+      const long r0 = Find(rT[kk]), r1 = Find(rT[kk + 1]), r2 = Find(rT[kk + 2]);
+      if (r0 == r1 || r1 == r2 || r2 == r0)
+        { continue; }
+      rT[lOut] = r0; rT[lOut + 1] = r1; rT[lOut + 2] = r2;
+      if (bUVs)
+        {
+          for (int c = 0; c < 3; c++)
+            { rOut.sTriangleUVs[lOut + c] = rOut.sTriangleUVs[kk + c]; }
+        }
+      lOut += 3;
+    }
+  rT.resize(lOut);
+  if (bUVs)
+    { rOut.sTriangleUVs.resize(lOut); }
+}
+
 // one surface normal (not reversed) per loop vertex of the face, as SMLib's output has: at the UV of the
 // vertex's first use in the face's triangles (seams, poles and creases have several), or at its first
 // loop occurrence when the output has no corner UVs; and the normal at each triangle corner
@@ -1408,6 +1576,7 @@ SmStatus SmTessellateFast
       // face triangulator doesn't follow SMLib with a maximum edge length or aspect ratio (triangle
       // counts -65% to +94% on the benchmark models), so it only runs without them.
       const SmBoolean bTrimmedFaces = (crOptions.bTrimmedFaces && dMaxEdgeLength <= 0.0 && dMaxAspectRatio <= 0.0) ? TRUE : FALSE;
+      const double    dTolerance    = pCopy->GetTolerance();  // as sm_CopyPhase2Triangles() and SmTess::OutputToPolyBrep()
       auto FastFace = [&](ULONG ii)
         {
           SmFastFaceWork & rWork = sWork[ii];
@@ -1442,6 +1611,7 @@ SmStatus SmTessellateFast
                                                : SmTriangulateRectangularFace(sIn, rWork.sOut);
           if (eFast == SM_SUCCESS && rWork.sOut.eStatus == SM_SUCCESS)
             {
+              sm_CollapseShortEdges(rWork.sOut, sLoopPoints, dTolerance / 100.0, rWork.bParallel);
               rWork.bFast = TRUE;
               rWork.bDone = TRUE;
             }
