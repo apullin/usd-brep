@@ -11,8 +11,8 @@ measured rounds, in a seeded random order. Timings cover tessellate() only.
 Every round hashes the meshes, with points and face normals at double
 precision; --save records hashes and timings, and --compare reports speedups
 and fails if any mesh changed. --fast times the opt-in fast tessellator,
-tessellate_fast(), instead, including building its Python mesh arrays, and
-hashes those float32 arrays.
+tessellate_fast(buffers=True), instead, including copying its arrays into
+Python buffers, and hashes those buffers, with the points at double precision.
 """
 
 import argparse
@@ -94,14 +94,16 @@ def describe_machine():
 def tessellate(sm, breps, parameters, fast=False):
     """Tessellate every Brep of a model; returns elapsed ns and meshes (exceptions for failures).
 
-    With fast, the meshes are tessellate_fast()'s arrays, which the timing includes building.
+    With fast, the meshes are tessellate_fast()'s buffers, which the timing includes copying.
     """
-    function = sm.tessellate_fast if fast else sm.tessellate
     meshes = []
     started = time.perf_counter_ns()
     for brep in breps:
         try:
-            meshes.append(function(brep, **parameters))
+            if fast:
+                meshes.append(sm.tessellate_fast(brep, buffers=True, **parameters))
+            else:
+                meshes.append(sm.tessellate(brep, **parameters))
         except RuntimeError as error:
             meshes.append(error)
     return time.perf_counter_ns() - started, meshes
@@ -121,11 +123,10 @@ def mesh_signature(meshes):
             digest.update(b"tessellation failed")
             summary.append(str(mesh))
             continue
-        if isinstance(mesh, dict):  # tessellate_fast() arrays, already float32
-            for key in ("points", "normals", "face_normals"):
-                digest.update(array("d", itertools.chain.from_iterable(mesh[key])).tobytes())
-            digest.update(array("q", mesh["faces"]).tobytes())
-            summary.append(len(mesh["face_normals"]))
+        if isinstance(mesh, dict):  # tessellate_fast() buffers: points as the kernel's doubles
+            for key in ("points", "normals", "triangles", "face_ids", "face_kinds"):
+                digest.update(mesh[key].tobytes())
+            summary.append(len(mesh["triangles"]) // 3)
             continue
         digest.update(array("d", itertools.chain.from_iterable(mesh.get_points())).tobytes())
         digest.update(array("d", itertools.chain.from_iterable(face.get_normal() for face in mesh.get_faces())).tobytes())

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from array import array
 from typing import Literal, Sequence, TypeVar, TypedDict, overload
 
 from numpy import float32, int32
@@ -51,6 +52,13 @@ class FastTessellationReport(TypedDict):
     fast_face_count: int
     fallback_face_count: int
     failed_face_count: int
+
+class FastTessellationBuffers(TypedDict):
+    points: array[float]      # 'd' float64, 3 per vertex
+    normals: array[float]     # 'f' float32, 3 per vertex, or 3 per corner with face_varying_normals
+    triangles: array[int]     # 'i' int32, 3 vertex indices per triangle
+    face_ids: array[int]      # 'i' int32, source face of each triangle
+    face_kinds: array[int]    # 'b' int8 per face: 0 failed, 1 fast, 2 fallback
 
 # Loop / Loopuse / Edgeuse topology, topology_pick_ray, and kernel Draw extraction
 # live in the separate _smlib_dev module. See
@@ -438,6 +446,7 @@ def tessellate_fast(
     allow_partial: Literal[False] = False,
     face_varying_normals: bool = False,
     return_report: Literal[False] = False,
+    buffers: Literal[False] = False,
 ) -> dict[str, list[object]]: ...
 @overload
 def tessellate_fast(
@@ -451,7 +460,36 @@ def tessellate_fast(
     allow_partial: bool = False,
     face_varying_normals: bool = False,
     return_report: Literal[True],
+    buffers: Literal[False] = False,
 ) -> tuple[dict[str, list[object]], FastTessellationReport]: ...
+@overload
+def tessellate_fast(
+    brep: Brep,
+    *,
+    chord_height_tolerance: float = 0.0,
+    curve_angle_tolerance_deg: float = 25.0,
+    surface_angle_tolerance_deg: float = 25.0,
+    max_edge_length: float = 0.0,
+    max_aspect_ratio: float = 0.0,
+    allow_partial: bool = False,
+    face_varying_normals: bool = False,
+    return_report: Literal[False] = False,
+    buffers: Literal[True],
+) -> FastTessellationBuffers: ...
+@overload
+def tessellate_fast(
+    brep: Brep,
+    *,
+    chord_height_tolerance: float = 0.0,
+    curve_angle_tolerance_deg: float = 25.0,
+    surface_angle_tolerance_deg: float = 25.0,
+    max_edge_length: float = 0.0,
+    max_aspect_ratio: float = 0.0,
+    allow_partial: bool = False,
+    face_varying_normals: bool = False,
+    return_report: Literal[True],
+    buffers: Literal[True],
+) -> tuple[FastTessellationBuffers, FastTessellationReport]: ...
 
 def read_brep_from_file(
     filename: str,

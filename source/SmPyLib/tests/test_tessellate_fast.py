@@ -4,6 +4,8 @@
 
 """Tests for _omni_solid.tessellate_fast, the opt-in fast tessellator, on bundled models."""
 
+import array
+import gc
 import math
 import os
 import subprocess
@@ -12,6 +14,11 @@ import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - the repo's Python has no numpy
+    np = None
 
 if sys.platform == "win32":
     for p in os.environ.get("PATH", "").split(";"):
@@ -241,6 +248,93 @@ class TestTessellateFastBundledModels(unittest.TestCase):
             with self.subTest(model=name):
                 self.assertEqual(sm.tessellate_fast(brep, return_report=True),
                                  sm.tessellate_fast(brep, return_report=True))
+
+
+_BUFFER_TYPES = {"points": ("d", 8), "normals": ("f", 4), "triangles": ("i", 4), "face_ids": ("i", 4),
+                 "face_kinds": ("b", 1)}
+_KIND_CODES = {"failed": 0, "fast": 1, "fallback": 2}
+
+
+def _flat(rows):
+    return [value for row in rows for value in row]
+
+
+class TestTessellateFastBuffers(unittest.TestCase):
+    """buffers=True: flat typed array.array buffers with the values of the default output."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.breps = _bundled_breps()
+
+    def test_layout(self):
+        sphere = sm.create_sphere((0, 0, 0), 5)
+        for face_varying in (False, True):
+            with self.subTest(face_varying_normals=face_varying):
+                buffers = sm.tessellate_fast(sphere, face_varying_normals=face_varying, buffers=True)
+                self.assertEqual(sorted(buffers), sorted(_BUFFER_TYPES))
+                for key, (typecode, itemsize) in _BUFFER_TYPES.items():
+                    self.assertIsInstance(buffers[key], array.array)
+                    self.assertEqual((buffers[key].typecode, buffers[key].itemsize), (typecode, itemsize))
+                vertices, triangles = len(buffers["points"]) // 3, len(buffers["triangles"]) // 3
+                self.assertEqual(len(buffers["points"]), 3 * vertices)
+                self.assertEqual(len(buffers["triangles"]), 3 * triangles)
+                self.assertEqual(len(buffers["normals"]), 9 * triangles if face_varying else 3 * vertices)
+                self.assertEqual(len(buffers["face_ids"]), triangles)
+                self.assertEqual(list(buffers["face_kinds"]), [_KIND_CODES["fast"]] * sphere.face_count())
+                # The (V, 3) layout without numpy: a 2D view of the same memory.
+                view = memoryview(buffers["points"]).cast("B").cast("d", [vertices, 3])
+                self.assertEqual(view.shape, (vertices, 3))
+                self.assertEqual(view[1, 2], buffers["points"][5])
+
+    def test_values_equal_default(self):
+        for name, brep in self.breps:
+            for face_varying in (False, True):
+                with self.subTest(model=name, face_varying_normals=face_varying):
+                    arrays, report = sm.tessellate_fast(brep, face_varying_normals=face_varying, return_report=True)
+                    buffers, buffers_report = sm.tessellate_fast(brep, face_varying_normals=face_varying,
+                                                                 return_report=True, buffers=True)
+                    self.assertEqual(buffers_report, report)
+                    # Points are the kernel's doubles; the default rounds them to float32.
+                    self.assertEqual(array.array("f", buffers["points"]).tolist(), _flat(arrays["points"]))
+                    self.assertEqual(buffers["normals"].tolist(), _flat(arrays["normals"]))
+                    faces = arrays["faces"]
+                    self.assertEqual(buffers["triangles"].tolist(),
+                                     [v for k in range(0, len(faces), 4) for v in faces[k + 1:k + 4]])
+                    self.assertEqual(buffers["face_ids"].tolist(), report["face_ids"])
+                    self.assertEqual(buffers["face_kinds"].tolist(), [_KIND_CODES[k] for k in report["face_kinds"]])
+
+    @unittest.skipIf(np is None, "numpy not installed")
+    def test_numpy_views_without_copies(self):
+        buffers = sm.tessellate_fast(sm.create_sphere((0, 0, 0), 5), buffers=True)
+        points = np.frombuffer(buffers["points"], dtype=np.float64).reshape(-1, 3)
+        triangles = np.frombuffer(buffers["triangles"], dtype=np.int32).reshape(-1, 3)
+        self.assertEqual(points.shape, (len(buffers["points"]) // 3, 3))
+        self.assertEqual(int(triangles.max()), points.shape[0] - 1)
+        buffers["points"][0] = 123.0  # a view, not a copy
+        self.assertEqual(points[0, 0], 123.0)
+
+    def test_partial(self):
+        # Two of its faces fail; with buffers, face_kinds tells which, so no report is needed.
+        sm.usd.ensure_plugin_registered()
+        (brep,) = sm.usd.import_breps(str(_TEST_FILES / "usd_TestFiles" / "RevitWallHealerCrash.usda"), heal=False)
+        _, report = sm.tessellate_fast(brep, allow_partial=True, return_report=True)
+        buffers = sm.tessellate_fast(brep, allow_partial=True, buffers=True)
+        failed = [face for face, kind in enumerate(buffers["face_kinds"]) if kind == _KIND_CODES["failed"]]
+        self.assertEqual(failed, report["failed_faces"])
+        self.assertTrue(failed)
+        self.assertFalse(set(buffers["face_ids"]) & set(failed))
+        with self.assertRaises(RuntimeError):
+            sm.tessellate_fast(brep, buffers=True)
+
+    def test_python_owned(self):
+        box = sm.create_box((0, 0, 0), 10, 20, 30)
+        first, second = (sm.tessellate_fast(box, buffers=True) for _ in range(2))
+        first["points"][0] = -1.0  # independent copies
+        self.assertNotEqual(second["points"][0], -1.0)
+        del box
+        gc.collect()
+        self.assertEqual(len(second["triangles"]), 36)  # outlive the Brep
+        self.assertEqual(max(second["triangles"]), 7)
 
 
 class TestFastTessellationSwitch(unittest.TestCase):

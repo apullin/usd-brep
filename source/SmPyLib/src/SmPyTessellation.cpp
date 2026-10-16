@@ -107,14 +107,46 @@ static SmVector3d unit_or(const SmVector3d& vector, const SmVector3d& fallback)
     return std::isfinite(length) && length > 1e-30 ? vector / length : fallback;
 }
 
+// Throws unless the arrays of SmApiTessellateFast's mesh have consistent sizes.
+static void check_fast_mesh(const SmFastTessellation& mesh, bool faceVaryingNormals)
+{
+    const ULONG nVerts = mesh.sPoints.GetSize() / 3;
+    const ULONG nTris = mesh.sTriangles.GetSize() / 3;
+    if (mesh.sPoints.GetSize() != 3 * nVerts || mesh.sTriangles.GetSize() != 3 * nTris || mesh.sNormals.GetSize() != 3 * nVerts
+        || mesh.sTriangleFaces.GetSize() != nTris || (faceVaryingNormals && mesh.sCornerNormals.GetSize() != 9 * nTris))
+        throw std::runtime_error("SmApiTessellateFast returned inconsistent mesh arrays");
+}
+
+// Corner normals as PolyBrep.to_mesh_arrays(face_varying_normals=True) gives them: each corner's normal of
+// its face, unit, or the vertex's normal when degenerate; 9 floats per triangle.
+static std::vector<float> fast_corner_normals(const SmFastTessellation& mesh)
+{
+    const ULONG nTris = mesh.sTriangles.GetSize() / 3;
+    std::vector<float> normals(9 * static_cast<size_t>(nTris));
+    for (ULONG t = 0; t < nTris; ++t)
+    {
+        for (ULONG c = 0; c < 3; ++c)
+        {
+            const float* corner = &mesh.sCornerNormals[9 * t + 3 * c];
+            const float* average = &mesh.sNormals[3 * mesh.sTriangles[3 * t + c]];
+            const SmVector3d cornerNormal = unit_or(SmVector3d(corner[0], corner[1], corner[2]),
+                                                    SmVector3d(average[0], average[1], average[2]));
+            float* out = &normals[9 * t + 3 * c];
+            out[0] = static_cast<float>(cornerNormal.x);
+            out[1] = static_cast<float>(cornerNormal.y);
+            out[2] = static_cast<float>(cornerNormal.z);
+        }
+    }
+    return normals;
+}
+
 // SmApiTessellateFast's mesh as PolyBrep.to_mesh_arrays() returns a mesh: float32 values, polygon
 // stream, vertex or corner normals, and face normals as SmPolyFace::GetNormal() computes them.
 static py::dict fast_mesh_arrays(const SmFastTessellation& mesh, bool faceVaryingNormals)
 {
+    check_fast_mesh(mesh, faceVaryingNormals);
     const ULONG nVerts = mesh.sPoints.GetSize() / 3;
     const ULONG nTris = mesh.sTriangles.GetSize() / 3;
-    if (mesh.sNormals.GetSize() != 3 * nVerts || (faceVaryingNormals && mesh.sCornerNormals.GetSize() != 9 * nTris))
-        throw std::runtime_error("SmApiTessellateFast returned inconsistent mesh arrays");
     std::vector<float> points(3 * static_cast<size_t>(nVerts));
     for (ULONG i = 0; i < 3 * nVerts; ++i)
         points[i] = static_cast<float>(mesh.sPoints[i]);
@@ -124,7 +156,7 @@ static py::dict fast_mesh_arrays(const SmFastTessellation& mesh, bool faceVaryin
     faces.reserve(4 * static_cast<size_t>(nTris));
     faceNormals.reserve(3 * static_cast<size_t>(nTris));
     if (faceVaryingNormals)
-        normals.reserve(9 * static_cast<size_t>(nTris));
+        normals = fast_corner_normals(mesh);
     else
         normals.assign(mesh.sNormals.GetDataArray(), mesh.sNormals.GetDataArray() + mesh.sNormals.GetSize());
     auto point = [&](int v) {
@@ -134,18 +166,6 @@ static py::dict fast_mesh_arrays(const SmFastTessellation& mesh, bool faceVaryin
     {
         const int* corners = &mesh.sTriangles[3 * t];
         faces.insert(faces.end(), { 3L, corners[0], corners[1], corners[2] });
-        if (faceVaryingNormals)
-        {
-            for (ULONG c = 0; c < 3; ++c)
-            {
-                const float* corner = &mesh.sCornerNormals[9 * t + 3 * c];
-                const float* average = &mesh.sNormals[3 * corners[c]];
-                const SmVector3d cornerNormal = unit_or(SmVector3d(corner[0], corner[1], corner[2]),
-                                                        SmVector3d(average[0], average[1], average[2]));
-                normals.insert(normals.end(), { static_cast<float>(cornerNormal.x), static_cast<float>(cornerNormal.y),
-                                                static_cast<float>(cornerNormal.z) });
-            }
-        }
         // As SmPolyFace::GetNormal() for a triangle: (1, 1, 1) when degenerate.
         const SmVector3d start = point(corners[0]);
         SmVector3d normal = (point(corners[1]) - start) * (point(corners[2]) - start);
@@ -161,6 +181,42 @@ static py::dict fast_mesh_arrays(const SmFastTessellation& mesh, bool faceVaryin
     out["normals"] = float3_list(normals);
     out["faces"] = int_list(faces);
     out["face_normals"] = float3_list(faceNormals);
+    return out;
+}
+
+// An array.array of the type code with count items copied from data: Python-owned memory, filled with
+// one copy, behind the buffer protocol (memoryview, numpy.frombuffer).
+static py::object typed_array(const char* typecode, size_t itemsize, const void* data, size_t count)
+{
+    py::object result = py::module_::import("array").attr("array")(typecode);
+    if (result.attr("itemsize").cast<size_t>() != itemsize)
+        throw std::runtime_error(std::string("array.array('") + typecode + "') items are not " + std::to_string(itemsize) + " bytes");
+    if (count > 0)
+        result.attr("frombytes")(py::memoryview::from_memory(data, static_cast<py::ssize_t>(count * itemsize)));
+    return result;
+}
+
+// SmApiTessellateFast's mesh as flat typed arrays, one copy each: points (double), vertex or corner
+// normals (float, the same values as fast_mesh_arrays), triangles and their faces (int32), face kinds (int8).
+static py::dict fast_mesh_buffers(const SmFastTessellation& mesh, bool faceVaryingNormals)
+{
+    static_assert(sizeof(int) == 4 && sizeof(float) == 4 && sizeof(double) == 8, "array.array type codes i, f, d");
+    check_fast_mesh(mesh, faceVaryingNormals);
+    py::dict out;
+    out["points"] = typed_array("d", sizeof(double), mesh.sPoints.GetDataArray(), mesh.sPoints.GetSize());
+    if (faceVaryingNormals)
+    {
+        const std::vector<float> normals = fast_corner_normals(mesh);
+        out["normals"] = typed_array("f", sizeof(float), normals.data(), normals.size());
+    }
+    else
+        out["normals"] = typed_array("f", sizeof(float), mesh.sNormals.GetDataArray(), mesh.sNormals.GetSize());
+    out["triangles"] = typed_array("i", sizeof(int), mesh.sTriangles.GetDataArray(), mesh.sTriangles.GetSize());
+    out["face_ids"] = typed_array("i", sizeof(int), mesh.sTriangleFaces.GetDataArray(), mesh.sTriangleFaces.GetSize());
+    std::vector<signed char> kinds(mesh.sFaceKinds.GetSize());
+    for (ULONG i = 0; i < mesh.sFaceKinds.GetSize(); ++i)
+        kinds[i] = static_cast<signed char>(mesh.sFaceKinds[i]);
+    out["face_kinds"] = typed_array("b", 1, kinds.data(), kinds.size());
     return out;
 }
 
@@ -188,10 +244,10 @@ static py::dict fast_report_to_dict(const SmFastTessellation& mesh)
 
 static py::object smpy_tessellate_fast(SmBrep* brep, double chord_height_tol, double curve_angle_tol_deg,
                                        double surface_angle_tol_deg, double max_edge_length, double max_aspect_ratio,
-                                       bool allow_partial, bool face_varying_normals, bool return_report)
+                                       bool allow_partial, bool face_varying_normals, bool return_report, bool buffers)
 {
-    if (allow_partial && !return_report)
-        throw py::value_error("allow_partial=True requires return_report=True");
+    if (allow_partial && !return_report && !buffers)
+        throw py::value_error("allow_partial=True requires return_report=True or buffers=True");
     SmTessellationParams params;
     params.dChordHeightTol     = chord_height_tol;
     params.dCurveAngleTolDeg   = curve_angle_tol_deg;
@@ -211,11 +267,11 @@ static py::object smpy_tessellate_fast(SmBrep* brep, double chord_height_tol, do
         throw std::runtime_error(std::string("SmApiTessellateFast failed: ") + sm_status_name(status) + " (" +
                                  std::to_string(status) + "). " + std::to_string(mesh.lFailedFaces) +
                                  " face(s) failed to tessellate (indices: " + faces +
-                                 "); allow_partial=True with return_report=True keeps the others");
+                                 "); allow_partial=True keeps the others (with return_report=True or buffers=True)");
     }
     if (status != SM_SUCCESS)
         SmPyRaise(status, "SmApiTessellateFast", __FILE__, __LINE__);
-    py::dict arrays = fast_mesh_arrays(mesh, face_varying_normals);
+    py::dict arrays = buffers ? fast_mesh_buffers(mesh, face_varying_normals) : fast_mesh_arrays(mesh, face_varying_normals);
     if (return_report)
         return py::make_tuple(arrays, fast_report_to_dict(mesh));
     return std::move(arrays);
@@ -391,6 +447,7 @@ void bind_tessellation(py::module_& m)
         py::arg("max_edge_length") = SmTessellationDefaults::kMaxEdgeLength,
         py::arg("max_aspect_ratio") = SmTessellationDefaults::kMaxAspectRatio,
         py::arg("allow_partial") = false, py::arg("face_varying_normals") = false, py::arg("return_report") = false,
+        py::arg("buffers") = false,
         "Pure: returns new mesh arrays; inputs unchanged.\n"
         "\n"
         "Tessellate a Brep with the opt-in fast tessellator into mesh arrays.\n"
@@ -403,9 +460,9 @@ void bind_tessellation(py::module_& m)
         "    max_edge_length: As for ``tessellate``. Keyword-only.\n"
         "    max_aspect_ratio: As for ``tessellate``. Keyword-only.\n"
         "    allow_partial: Keep the other faces when some faces fail; the failed\n"
-        "        ones are listed in the report. Defaults to ``False`` (raise\n"
-        "        instead). Requires ``return_report=True``; otherwise raises\n"
-        "        ValueError. Keyword-only.\n"
+        "        ones are listed in the report and in ``face_kinds``. Defaults to\n"
+        "        ``False`` (raise instead). Requires ``return_report=True`` or\n"
+        "        ``buffers=True``; otherwise raises ValueError. Keyword-only.\n"
         "    face_varying_normals: Return one normal per triangle corner, the\n"
         "        normal of its source face, instead of one averaged normal per\n"
         "        vertex, as ``PolyBrep.to_mesh_arrays`` does. Keyword-only.\n"
@@ -414,12 +471,29 @@ void bind_tessellation(py::module_& m)
         "        order), ``face_kinds`` (per face: ``fast``, ``fallback`` or\n"
         "        ``failed``), ``failed_faces`` and the count of each kind.\n"
         "        Defaults to ``False``. Keyword-only.\n"
+        "    buffers: Return flat typed ``array.array`` buffers instead of\n"
+        "        lists, filled with one copy from the kernel's arrays; see\n"
+        "        Returns. Defaults to ``False``. Keyword-only.\n"
         "\n"
         "Returns:\n"
         "    dict: The layout of ``PolyBrep.to_mesh_arrays``: ``points``,\n"
         "    ``normals`` and ``face_normals`` as lists of 3-tuples of floats\n"
         "    rounded to float32, and ``faces`` as a flat triangle stream\n"
-        "    ``[3, i0, i1, i2, 3, ...]``. ``(arrays, report)`` when\n"
+        "    ``[3, i0, i1, i2, 3, ...]``. With ``buffers=True``, a dict of\n"
+        "    ``array.array`` instead, each a flat C array behind the buffer\n"
+        "    protocol (V vertices, T triangles, F faces):\n"
+        "\n"
+        "    - ``points``: ``'d'`` (float64), 3V, shape (V, 3), unrounded\n"
+        "    - ``normals``: ``'f'`` (float32), 3V, shape (V, 3); 9T, shape\n"
+        "      (3T, 3) with ``face_varying_normals=True``\n"
+        "    - ``triangles``: ``'i'`` (int32), 3T, shape (T, 3), vertex\n"
+        "      indices counterclockwise seen from outside\n"
+        "    - ``face_ids``: ``'i'`` (int32), T: source face of each triangle\n"
+        "    - ``face_kinds``: ``'b'`` (int8), F: 0 failed, 1 fast,\n"
+        "      2 fallback\n"
+        "\n"
+        "    ``numpy.frombuffer(b[\"points\"], numpy.float64).reshape(-1, 3)``\n"
+        "    views one without a copy. ``(arrays, report)`` when\n"
         "    ``return_report=True``.\n"
         "\n"
         "Notes:\n"
