@@ -5,14 +5,17 @@
 * FILE NAME --- SmTessFast.h
 * PURPOSE: Opt-in fast tessellation of a Brep into flat triangle arrays.
 *
-*   SmTessellateFast() keeps SMLib's Phase 1 (SmTess::Phase1SetupBrep:
-*   edge tessellation, face refinement trees, edge splits), then
-*   triangulates every face directly into arrays, faces in parallel,
-*   using the edge vertices of Phase 1 so that seams stay watertight.
-*   A face that no fast triangulator handles goes through SMLib's own
-*   Phase 2 and its triangles are copied, with the same boundary
-*   vertices. It is deterministic at any thread count; it is not
-*   bit-identical to SmApiTessellate(), which stays unchanged.
+*   SmTessellateFast() gets the face boundaries from
+*   SmComputeFastBoundaries() (SmFastEdges.h: SMLib's edge rules without
+*   copying the Brep), then triangulates every face directly into
+*   arrays, faces in parallel, using the shared edge vertices so that
+*   seams stay watertight. A Brep with a face that path can't do keeps
+*   SMLib's Phase 1 (SmTess::Phase1SetupBrep: edge tessellation, face
+*   refinement trees, edge splits) instead, where a face that no fast
+*   triangulator handles goes through SMLib's own Phase 2 and its
+*   triangles are copied, with the same boundary vertices. It is
+*   deterministic at any thread count; it is not bit-identical to
+*   SmApiTessellate(), which stays unchanged.
 **********************************************************************/
 
 #ifndef __SMTESSFAST_H__
@@ -33,13 +36,15 @@ class SmTessSrfCache;
 /*******************************************************************//**
    Per-face triangulation interface.
 
-   SmTessellateFast() builds one SmFastFaceInput per face after Phase 1 and
-   calls SmTriangulateFastFace(), possibly on worker threads. A face whose
-   output status is not SM_SUCCESS goes through SMLib's Phase 2 instead.
+   SmTessellateFast() builds one SmFastFaceInput per face from the fast
+   boundaries (or after Phase 1) and calls SmTriangulateFastFace(), possibly
+   on worker threads. A face whose output status is not SM_SUCCESS goes
+   through SMLib's Phase 2 instead (after Phase 1 for the whole Brep).
 ***********************************************************************/
 
-// One vertex of a face boundary loop. Boundary vertices come from SMLib's Phase 1 edge tessellation and
-// are shared with neighboring faces through lId, which is what makes the result watertight. A
+// One vertex of a face boundary loop. Boundary vertices come from the edge discretization (the fast
+// boundaries' or SMLib's Phase 1) and are shared with neighboring faces through lId, which is what makes
+// the result watertight. A
 // triangulator must use them exactly: never move or merge them, and never add a vertex on a boundary
 // segment.
 struct SmFastLoopVertex
@@ -77,7 +82,9 @@ enum SmFastFaceFailure
   SM_FF_NONE = 0,  // not rejected
   SM_FF_LOOPS,     // its boundary loops are unusable (crossing, clockwise, duplicate points, bad input): the
                    // pipeline sends the faces that share a loop segment with it to SMLib too
-  SM_FF_OTHER      // any other reason
+  SM_FF_OTHER,     // any other reason
+  SM_FF_SPLIT      // loop segments too coarse for the surface (sSplitSegments): with them split in both
+                   // faces, the triangulation can be valid
 };
 
 struct SmFastFaceOutput
@@ -95,6 +102,8 @@ struct SmFastFaceOutput
   // Optional, 3 per triangle: the UV of each corner. Where a loop vertex occurs at several UVs of the face
   // (a seam, a pole, a crease), the pipeline evaluates its corner normals at the UV the triangle uses.
   std::vector<SmPoint2d> sTriangleUVs;
+  // With SM_FF_SPLIT: pairs of loop vertex ids, the segments to split.
+  std::vector<long> sSplitSegments;
 };
 
 // Triangulators must be deterministic and must not touch shared SMLib state (no marks, no Notify, no
@@ -134,6 +143,13 @@ struct SmFastMesh
   double dFallbackMs    = 0.0; // SMLib Phase 2 of fallback faces
   double dAssemblyMs    = 0.0; // global arrays and normals
   double dCleanupMs     = 0.0; // deleting the Phase 1 data
+
+  // fast boundaries (SmFastOptions::bFastBoundaries)
+  ULONG     lFanFaces      = 0;         // faces without area in UV: their single loop triangulated in 3D
+  SmBoolean bWholeFallback = FALSE;     // a face the fast boundaries can't do: the Brep took the Phase 1 path
+  long      lFallbackFace  = -1;        // ... the first such face
+  double    dBoundariesMs  = 0.0;       // SmComputeFastBoundaries() with its refinement trees
+  ULONG     lSplitRounds   = 0;         // extra boundary rounds that split loop segments for trimmed faces
 };
 
 struct SmFastOptions
@@ -146,13 +162,31 @@ struct SmFastOptions
                                       // chords other faces' triangles use too, go to SMLib as well
   SmBoolean bAllowPartial   = FALSE;  // TRUE: faces that fail are skipped instead of failing the call
   SmBoolean bFastRefinement = TRUE;   // FALSE: SMLib's own refinement tree build (the same tree, slower)
+  SmBoolean bFastBoundaries = TRUE;   // edges and loops from SmComputeFastBoundaries() instead of SMLib's
+                                      // Phase 1 on a copy of the Brep (see SmTessellateWithFastBoundaries())
 };
 
-// Tessellates pBrep (not modified) into rMesh. Returns SM_SUCCESS, or an error when Phase 1 fails or,
-// unless crOptions.bAllowPartial, when some face could not be tessellated.
+// Tessellates pBrep (not modified, but for lazily built evaluation data of its curves and surfaces) into
+// rMesh. Returns SM_SUCCESS, or an error when Phase 1 fails or, unless crOptions.bAllowPartial, when some
+// face could not be tessellated. Calls for Breps of one SmContext run one at a time (the context's state
+// isn't for concurrent operations); with a notification callback registered on the context, everything
+// runs on the calling thread. A call made from a notification callback of a call for another context
+// returns SM_ERR at once if another thread's call has its context (waiting could deadlock).
 SM_EXPORT SmStatus SmTessellateFast(const SmBrep              * cpBrep,
                                     const SmTessellationParams & crParams,
                                     SmFastMesh                 & rMesh,
                                     const SmFastOptions        & crOptions = SmFastOptions());
+
+// The path SmTessellateFast() tries first with bFastBoundaries: boundaries from SmComputeFastBoundaries(),
+// the fast triangulators (with up to 6 rounds that split loop segments a trimmed face needs split, in
+// both of their faces), and faces whose loops enclose no area in UV triangulated from their loops in 3D
+// (holes kept). Returns SM_ERR_TESS_FAIL_FACE, with rMesh empty but for dBoundariesMs and lFallbackFace,
+// when a face has no boundary, its faceuse contradicts it (SmFastFaceBoundary::bLoopsReversed: SMLib's mesh
+// of it folds) or the triangulators reject it; SmTessellateFast() then takes the Phase 1 path for the
+// whole Brep. Ignores bFastFaces, bNeighborFallback and bAllowPartial (every face gets triangles or none does).
+SM_EXPORT SmStatus SmTessellateWithFastBoundaries(const SmBrep              * cpBrep,
+                                                  const SmTessellationParams & crParams,
+                                                  SmFastMesh                 & rMesh,
+                                                  const SmFastOptions        & crOptions = SmFastOptions());
 
 #endif // !__SMTESSFAST_H__

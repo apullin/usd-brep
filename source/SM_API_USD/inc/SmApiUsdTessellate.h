@@ -78,7 +78,9 @@ SM_API_USD_EXPORT SmStatus SmApiUsdTessellateBrepArray
 
 /// As above, with the tessellator chosen by the caller. Both tessellators fill the results
 /// with the same conventions; SM_API_USD_TESSELLATOR_FAST orders the GeomSubsets by their first
-/// face. An invalid eTessellator returns SM_ERR_INVALID_INPUT with one whole-prim result.
+/// face, and samples the edges with SmComputeFastEdgePolylines() (SmFastEdges.h: the same edges,
+/// order and layout as GetBoundaryData, edges in parallel, not the same points). An invalid
+/// eTessellator returns SM_ERR_INVALID_INPUT with one whole-prim result.
 SM_API_USD_EXPORT SmStatus SmApiUsdTessellateBrepArray
 (
     const pxr::UsdPrim                     & crBrepArray,          ///< [in ]: BrepArray prim

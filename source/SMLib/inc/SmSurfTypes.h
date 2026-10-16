@@ -117,6 +117,7 @@ class SmSTEPSurface;
 #define SmSurfaceTessDriver_TYPE    (SURF_BASE_TYPE + 152)
 #define SmViewBasedTessDriver_TYPE  (SURF_BASE_TYPE + 154)
 #define SmFastSurfaceTessDriver_TYPE (SURF_BASE_TYPE + 156)  /* SmTessFast.cpp: selects SmTessSrfCache::BuildTreeFast() */
+#define SmFastTessSrfCache_TYPE     (SURF_BASE_TYPE + 158)  /* SmFastTessSrfCache.h: SmComputeFastBoundaries()' cache */
 
 #define SmSrfInVolume_TYPE          (SURF_BASE_TYPE + 218)  /* SURF_BASE_TYPE:[15000] */
 #define SmOffsetSurface_TYPE        (SURF_BASE_TYPE + 400)
@@ -140,6 +141,7 @@ class SmSTEPSurface;
 : (a) == SmSurfaceTessDriver_TYPE    ? _T("SmSurfaceTessDriver  ") \
 : (a) == SmViewBasedTessDriver_TYPE  ? _T("SmViewBasedTessDriver") \
 : (a) == SmFastSurfaceTessDriver_TYPE ? _T("SmFastSurfaceTessDriver") \
+: (a) == SmFastTessSrfCache_TYPE     ? _T("SmFastTessSrfCache   ") \
 : (a) == SmSrfInVolume_TYPE          ? _T("SmSrfInVolume        ") \
 : (a) == SmOffsetSurface_TYPE        ? _T("SmOffsetSurface      ") \
 : (a) == SmSTEPSurface_TYPE          ? _T("SmSTEPSurface        ") \

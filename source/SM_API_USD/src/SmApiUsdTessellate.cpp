@@ -36,6 +36,7 @@
 #include "SmBrep.h"
 #include "SmContext.h"
 #include "SmFace.h"
+#include "SmFastEdges.h"
 #include "SmMessages.h"
 
 #include <tbb/parallel_for.h>
@@ -43,6 +44,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -154,6 +156,41 @@ static SmStatus sm_GetFastMeshData(const SmBrep& crBrep, const SmFastTessellatio
     return SM_SUCCESS;
 }
 
+// GetBoundaryData()'s arrays (one polyline per edge at the given curve angle, polylines of fewer than two
+// points left out, failed edges reported by the status with the others kept) from
+// SmComputeFastEdgePolylines(): the edges in parallel, for the fast tessellator.
+static SmStatus sm_GetFastBoundaryData(const SmBrep* cpBrep, double dAngleTolDeg, pxr::VtArray<pxr::GfVec3f>& rPoints,
+                                       pxr::VtIntArray& rVertexCounts)
+{
+    rPoints.clear();
+    rVertexCounts.clear();
+    if (!cpBrep)
+        return SM_ERR_INVALID_INPUT;
+    if (!std::isfinite(dAngleTolDeg) || dAngleTolDeg <= 0.0)
+        return SM_ERR_INVALID_INPUT;
+    SmTessellationParams sParams;  // the curve angle alone, as SmBrep::TessellateBoundaries()
+    sParams.dChordHeightTol = 0.0;
+    sParams.dCurveAngleTolDeg = dAngleTolDeg;
+    sParams.dMaxEdgeLength = 0.0;
+    sParams.dMaxAspectRatio = 0.0;
+    SmFastEdgePolylines sPolylines;
+    const SmStatus status = SmComputeFastEdgePolylines(cpBrep, sParams, sPolylines);
+    rPoints.reserve(sPolylines.sPoints.size());
+    for (size_t ee = 0; ee + 1 < sPolylines.sOffsets.size(); ++ee)
+    {
+        const size_t lBegin = sPolylines.sOffsets[ee], lEnd = sPolylines.sOffsets[ee + 1];
+        if (lEnd - lBegin < 2)
+            continue;
+        rVertexCounts.push_back(static_cast<int>(lEnd - lBegin));
+        for (size_t kk = lBegin; kk < lEnd; ++kk)
+        {
+            const SmPoint3d& p = sPolylines.sPoints[kk];
+            rPoints.emplace_back(static_cast<float>(p.x), static_cast<float>(p.y), static_cast<float>(p.z));
+        }
+    }
+    return status;
+}
+
 // The mesh part of one SmApiUsdTessellateBrepArray result, through SmApiTessellateFast, with the same
 // partial-mesh policy, failed faces, statuses and messages as the SmApiTessellate path.
 static void sm_TessellateFast(const SmBrep& crBrep, const SmTessellationParams& crParams, const std::string& crIndex,
@@ -258,9 +295,12 @@ SmStatus SmApiUsdTessellateBrepArray
             rResult.m_sMaterialPath = pMaterial->GetMaterialPaths()->front();
 
         if (dBoundaryAngleTolDeg > 0.0)
-            rResult.m_sBoundaryStatus = SMU_BrepConvert::GetBoundaryData(pBrep, dBoundaryAngleTolDeg,
-                                                                         rResult.m_sBoundaryPoints,
-                                                                         rResult.m_sBoundaryVertexCounts);
+            rResult.m_sBoundaryStatus =
+                (eTessellator == SM_API_USD_TESSELLATOR_FAST)
+                    ? sm_GetFastBoundaryData(pBrep, dBoundaryAngleTolDeg, rResult.m_sBoundaryPoints,
+                                             rResult.m_sBoundaryVertexCounts)
+                    : SMU_BrepConvert::GetBoundaryData(pBrep, dBoundaryAngleTolDeg, rResult.m_sBoundaryPoints,
+                                                       rResult.m_sBoundaryVertexCounts);
 
         if (eTessellator == SM_API_USD_TESSELLATOR_FAST)
         {

@@ -632,11 +632,35 @@ static SmStatus TestTessellateBrepArray(SmApiUsdTessellator eTessellator)
     SER(TessellateBrepArray(partialPrim, 5.0, eTessellator, results));
     if (results.size() != 1 || CheckTessellatedBrep(results[0]) != SM_SUCCESS || results[0].m_sBoundaryPoints.empty())
         return SM_ERR;
-    if (results[0].m_sFailedFaces.size() != 1 || results[0].m_sFailedFaces[0] != 0)
-        return SM_ERR;
-    for (const pxr::GfVec3f& rPoint : results[0].m_sPoints)
-        if (std::abs(rPoint[2]) > 1e-4f && std::abs(rPoint[2] - 10.0f) > 1e-4f)
-            return SM_ERR;  // the failed side face was meshed
+    // The fast tessellator gets its face boundaries from the 3D edges, without UV trims: it meshes the
+    // side face too.
+    const bool bFast = eTessellator == SM_API_USD_TESSELLATOR_FAST
+                       || (eTessellator == SM_API_USD_TESSELLATOR_DEFAULT && SmApiUsdGetDefaultTessellator() == SM_API_USD_TESSELLATOR_FAST);
+    if (bFast)
+    {
+        bool bSide = false;  // a triangle from one cap's edge to the other's
+        const pxr::VtIntArray& rIndices = results[0].m_sFaceVertexIndices;
+        for (size_t tt = 0; tt + 2 < rIndices.size(); tt += 3)
+        {
+            float fLow = 1e30f, fHigh = -1e30f;
+            for (size_t cc = 0; cc < 3; ++cc)
+            {
+                fLow = std::min(fLow, results[0].m_sPoints[rIndices[tt + cc]][2]);
+                fHigh = std::max(fHigh, results[0].m_sPoints[rIndices[tt + cc]][2]);
+            }
+            bSide = bSide || (fLow < 1e-4f && fHigh > 10.0f - 1e-4f);
+        }
+        if (!results[0].m_sFailedFaces.empty() || !bSide)
+            return SM_ERR;
+    }
+    else
+    {
+        if (results[0].m_sFailedFaces.size() != 1 || results[0].m_sFailedFaces[0] != 0)
+            return SM_ERR;
+        for (const pxr::GfVec3f& rPoint : results[0].m_sPoints)
+            if (std::abs(rPoint[2]) > 1e-4f && std::abs(rPoint[2] - 10.0f) > 1e-4f)
+                return SM_ERR;  // the failed side face was meshed
+    }
 
     // A member that fails to import does not discard its neighbours.
     const std::string sMixedFilename = kOutputDir + "test_tessellate_brep_array_mixed.usda";
@@ -731,11 +755,25 @@ static SmStatus TestTessellateBrepArrayFast()
     SER(CheckTessellatedBrep(fast[0]));
     const SmApiUsdTessellatedBrep& rSmlib = smlib[0];
     const SmApiUsdTessellatedBrep& rFast = fast[0];
-    // Everything but the mesh is the same; the mesh is another tessellation of the same surfaces.
+    // Everything but the mesh and the edge samples is the same; the mesh is another tessellation of the same
+    // surfaces, and the edges are sampled by SmComputeFastEdgePolylines(): one polyline per edge as
+    // GetBoundaryData, with the same ends.
+    if (rFast.m_sBoundaryVertexCounts.size() != rSmlib.m_sBoundaryVertexCounts.size()
+        || rFast.m_sBoundaryPoints.size() < 0.9 * rSmlib.m_sBoundaryPoints.size()
+        || rFast.m_sBoundaryPoints.size() > 1.1 * rSmlib.m_sBoundaryPoints.size())
+        return SM_ERR;
+    for (size_t ii = 0, lFast = 0, lSmlib = 0; ii < rFast.m_sBoundaryVertexCounts.size(); ++ii)
+    {
+        const size_t lFastEnd = lFast + rFast.m_sBoundaryVertexCounts[ii] - 1, lSmlibEnd = lSmlib + rSmlib.m_sBoundaryVertexCounts[ii] - 1;
+        if ((rFast.m_sBoundaryPoints[lFast] - rSmlib.m_sBoundaryPoints[lSmlib]).GetLength() > 1e-4f
+            || (rFast.m_sBoundaryPoints[lFastEnd] - rSmlib.m_sBoundaryPoints[lSmlibEnd]).GetLength() > 1e-4f)
+            return SM_ERR;
+        lFast = lFastEnd + 1;
+        lSmlib = lSmlibEnd + 1;
+    }
     if (rFast.m_iPackedBrepIndex != rSmlib.m_iPackedBrepIndex || rFast.m_sStatus != rSmlib.m_sStatus
         || rFast.m_sMessage != rSmlib.m_sMessage || rFast.m_sFailedFaces != rSmlib.m_sFailedFaces
-        || rFast.m_sBoundaryStatus != rSmlib.m_sBoundaryStatus || rFast.m_sBoundaryPoints != rSmlib.m_sBoundaryPoints
-        || rFast.m_sBoundaryVertexCounts != rSmlib.m_sBoundaryVertexCounts
+        || rFast.m_sBoundaryStatus != rSmlib.m_sBoundaryStatus
         || rFast.m_sNormalsInterpolation != rSmlib.m_sNormalsInterpolation
         || rFast.m_sNormalsInterpolation != pxr::UsdGeomTokens->faceVarying
         || rFast.m_sSubdivisionScheme != rSmlib.m_sSubdivisionScheme || rFast.m_sMaterialPath != rSmlib.m_sMaterialPath

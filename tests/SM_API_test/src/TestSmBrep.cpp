@@ -17,6 +17,12 @@
 #include <SmCurve.h>
 #include <SmPoly.h>
 #include <SmEdge.h>
+#include <SmContext.h>
+#include <SmPrimitiveCreation.h>
+#include <SmAxis2Placement.h>
+#include <SmEdgeuse.h>
+#include <SmFaceuse.h>
+#include <SmBSplineCurve.h>
 #include <limits>
 #include <memory>
 
@@ -30,10 +36,15 @@
 #include <SmApiSurfaces.h>
 #include <SmApiPolygons.h>
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <mutex>
 #include <cstdio>
 #include <limits>
 #include <map>
+#include <thread>
 #include <vector>
 
 //*************************************************************************
@@ -1489,7 +1500,9 @@ static SmStatus TestSmTessellateFast()
             return SM_ERR;
 
     // A face whose trim curves leave its surface's domain fails: rejected unless partial output is
-    // allowed, with the face kinds kept either way.
+    // allowed, with the face kinds kept either way. (The fast boundaries don't use trim curves; the
+    // face's surface moved off its edges fails them too, so the Brep takes the Phase 1 path, where the
+    // face fails.)
     SER(box->TurnToNURBS());
     SmTArray<SmFace*> faces;
     box->GetFaces(faces);
@@ -1502,6 +1515,7 @@ static SmStatus TestSmTessellateFast()
         SER(edgeuse->GetOrCreateUVTrimCurve(uv));
         SER(uv->Transform(shift));
     }
+    SER(faces[3]->GetSurface()->Transform(shift));
     for (SmBoolean bAllowPartial : { FALSE, TRUE })
     {
         const SmStatus status = SmApiTessellateFast(box, mesh, SmTessellationParams(), bAllowPartial);
@@ -1525,11 +1539,285 @@ static SmStatus TestSmTessellateFast()
             SER(edgeuse->GetOrCreateUVTrimCurve(uv));
             SER(uv->Transform(shift));
         }
+        SER(face->GetSurface()->Transform(shift));
     }
     if (SmApiTessellateFast(box, mesh, SmTessellationParams(), TRUE) == SM_SUCCESS || mesh.lFailedFaces != 6 ||
         !mesh.sPoints.IsEmpty() || !mesh.sTriangles.IsEmpty())
         return SM_ERR;
     if (SmApiTessellateFast(nullptr, mesh) == SM_SUCCESS || !mesh.sPoints.IsEmpty() || !mesh.sFaceKinds.IsEmpty())
+        return SM_ERR;
+    return SM_SUCCESS;
+}
+
+// Edges of the brep with a UV trim curve (stored once per edgeuse and mate).
+static ULONG CountUVTrimCurves(const SmBrep* pBrep)
+{
+    SmTArray<SmEdge*> edges;
+    pBrep->GetEdges(edges);
+    ULONG lCount = 0;
+    for (SmEdge* edge : edges)
+    {
+        SmTArray<SmEdgeuse*> edgeuses;
+        edge->GetEdgeuses(edgeuses);
+        for (SmEdgeuse* edgeuse : edgeuses)
+            if (edgeuse->GetUVTrimCurve() != nullptr)
+            {
+                ++lCount;
+                break;
+            }
+    }
+    return lCount;
+}
+
+// SmApiTessellateFast leaves the caller's brep as it was: a one-face B-spline brep, with and without UV trim
+// curves (the fast path doesn't create them), gives the same mesh when tessellated again.
+static SmStatus TestSmTessellateFastLeavesBrep()
+{
+    SmTArray<SmPoint3d> points;
+    for (int ii = 0; ii < 12; ++ii)
+        for (int jj = 0; jj < 12; ++jj)
+            points.Add(SmPoint3d(ii, jj, 0.3 * std::sin(0.7 * ii) * std::cos(0.5 * jj)));
+    SmSurface* surface = nullptr;
+    SER(SmApiCreateSurface(points, 12, 12, surface));
+    SmBrep* brep = new (*surface->GetContext()) SmBrep();
+    std::unique_ptr<SmBrep> ownedBrep(brep);
+    SmFace* face = nullptr;
+    SER(brep->CreateFaceFromSurface(surface, surface->GetNaturalUVDomain(), face));
+    SmTArray<SmEdgeuse*> edgeuses;
+    face->GetUpwardFaceuse()->GetEdgeuses(edgeuses);
+    for (SmEdgeuse* edgeuse : edgeuses)
+    {
+        SmBSplineCurve* uv = nullptr;
+        SER(edgeuse->GetOrCreateUVTrimCurve(uv));
+    }
+    if (CountUVTrimCurves(brep) != 4)
+        return SM_ERR;
+
+    // With UV trim curves: the fast path, nothing added.
+    SmFastTessellation mesh, again;
+    SER(SmApiTessellateFast(brep, mesh));
+    if (mesh.sFaceKinds.GetSize() != 1 || mesh.sFaceKinds[0] != SM_FAST_FACE_FAST || CountUVTrimCurves(brep) != 4)
+        return SM_ERR;
+    SER(SmApiTessellateFast(brep, again));
+    if (!SameFastTessellation(mesh, again))
+        return SM_ERR;
+
+    // Without them: the fast path again, which doesn't create them either.
+    SmTArray<SmEdge*> edges;
+    brep->GetEdges(edges);
+    for (SmEdge* edge : edges)
+        SER(edge->RemoveUVTrimCurves());
+    if (CountUVTrimCurves(brep) != 0)
+        return SM_ERR;
+    SER(SmApiTessellateFast(brep, mesh));
+    if (mesh.sFaceKinds.GetSize() != 1 || mesh.sFaceKinds[0] != SM_FAST_FACE_FAST || CountUVTrimCurves(brep) != 0)
+        return SM_ERR;
+    SER(SmApiTessellateFast(brep, again));
+    if (!SameFastTessellation(mesh, again) || CountUVTrimCurves(brep) != 0)
+        return SM_ERR;
+    return SM_SUCCESS;
+}
+
+// A notification callback that records whether two calls ever overlapped.
+class sm_ConcurrentNotifyProbe : public SmNotifyCallback
+{
+public:
+    std::atomic<int>  m_iActive{0};
+    std::atomic<int>  m_iMaxActive{0};
+    std::atomic<long> m_lCalls{0};
+    SmStatus Execute(SmNotifyOperation, SmObject*, SmObject*, SmObject*, SmObject*) override
+    {
+        const int iActive = ++m_iActive;
+        int iMax = m_iMaxActive.load();
+        while (iActive > iMax && !m_iMaxActive.compare_exchange_weak(iMax, iActive)) {}
+        ++m_lCalls;
+        for (volatile int ii = 0; ii < 2000; ii = ii + 1) {}  // widens the window for an overlap
+        --m_iActive;
+        return SM_SUCCESS;
+    }
+};
+
+// With a notification callback registered, SmApiTessellateFast calls it from one thread at a time (objects it
+// creates and deletes notify it): two large B-spline faces, whose refinement trees would fork worker tasks,
+// with a chord height tolerance (the tree tests make temporary surfaces).
+static SmStatus TestSmTessellateFastNotifyCallback()
+{
+    SmBrep* brep = nullptr;
+    for (int kk = 0; kk < 2; ++kk)
+    {
+        SmTArray<SmPoint3d> points;
+        for (int ii = 0; ii < 40; ++ii)
+            for (int jj = 0; jj < 40; ++jj)
+                points.Add(SmPoint3d(ii, jj + 50.0 * kk, 2.0 * std::sin(0.4 * ii) * std::cos(0.3 * jj)));
+        SmSurface* surface = nullptr;
+        SER(SmApiCreateSurface(points, 40, 40, surface));
+        if (brep == nullptr)
+            brep = new (*surface->GetContext()) SmBrep();
+        SmFace* face = nullptr;
+        SER(brep->CreateFaceFromSurface(surface, surface->GetNaturalUVDomain(), face));
+    }
+    std::unique_ptr<SmBrep> ownedBrep(brep);
+    SmContext* pContext = SM_CONST_CAST(SmContext*, brep->GetContext());
+    sm_ConcurrentNotifyProbe probe;
+    SmNotifyCallback* pOld = pContext->GetUserNotifyCallback();
+    pContext->SetUserNotifyCallback(&probe);
+    SmTessellationParams params;
+    params.dChordHeightTol = 0.002;
+    SmFastTessellation mesh;
+    const SmStatus status = SmApiTessellateFast(brep, mesh, params);
+    pContext->SetUserNotifyCallback(pOld);
+    SER(status);
+    if (mesh.lFailedFaces != 0 || mesh.sTriangles.IsEmpty())
+        return SM_ERR;
+    SmFastTessellation threaded;  // without the callback, on worker threads: the same mesh
+    SER(SmApiTessellateFast(brep, threaded, params));
+    if (!SameFastTessellation(mesh, threaded))
+        return SM_ERR;
+    if (probe.m_lCalls == 0 || probe.m_iMaxActive != 1)
+    {
+        printf("TestSmTessellateFastNotifyCallback: %ld calls, up to %d at once\n", probe.m_lCalls.load(), probe.m_iMaxActive.load());
+        return SM_ERR;
+    }
+    return SM_SUCCESS;
+}
+
+// SmApiTessellateFast on two threads at once, for two breps of one context, leaves the context as it was
+// (both calls set and restore its DoingBoolean state) and gives each brep its usual mesh.
+static SmStatus TestSmTessellateFastSharedContext()
+{
+    SmVector3d origin(0.0, 0.0, 0.0);
+    SmBrep* breps[2] = { nullptr, nullptr };
+    SER(SmApiCreateBox(origin, 10.0, 20.0, 30.0, breps[0]));
+    std::unique_ptr<SmBrep> ownedBox(breps[0]);
+    SER(SmApiCircularFillet(breps[0], 2.0));
+    SER(SmApiCreateSphere(SmVector3d(50.0, 0.0, 0.0), 5.0, breps[1]));
+    std::unique_ptr<SmBrep> ownedSphere(breps[1]);
+    const SmContext* cpContext = breps[0]->GetContext();
+    if (breps[1]->GetContext() != cpContext || cpContext->GetDoingBoolean())
+        return SM_ERR;
+    SmFastTessellation expected[2];
+    for (int ii = 0; ii < 2; ++ii)
+        SER(SmApiTessellateFast(breps[ii], expected[ii]));
+    for (int iRound = 0; iRound < 40; ++iRound)
+    {
+        SmFastTessellation meshes[2];
+        SmStatus statuses[2] = { SM_ERR, SM_ERR };
+        std::thread threads[2];
+        for (int ii = 0; ii < 2; ++ii)
+            threads[ii] = std::thread([&, ii] { statuses[ii] = SmApiTessellateFast(breps[ii], meshes[ii]); });
+        for (std::thread& thread : threads)
+            thread.join();
+        for (int ii = 0; ii < 2; ++ii)
+            if (statuses[ii] != SM_SUCCESS || !SameFastTessellation(meshes[ii], expected[ii]))
+                return SM_ERR;
+        if (cpContext->GetDoingBoolean())
+        {
+            printf("TestSmTessellateFastSharedContext: DoingBoolean left set after round %d\n", iRound);
+            return SM_ERR;
+        }
+    }
+    return SM_SUCCESS;
+}
+
+// A whole torus in rContext (SmApiCreate* use the default context).
+static SmStatus CreateTorusIn(SmContext& rContext, double dX, SmBrep*& rpBrep)
+{
+    rpBrep = new (rContext) SmBrep(SM_USE_DEFAULT, SM_USE_DEFAULT, &rContext);
+    SmAxis2Placement frame;
+    frame.SetCanonical(SmVector3d(dX, 0.0, 0.0), SmVector3d(1.0, 0.0, 0.0), SmVector3d(0.0, 1.0, 0.0));
+    SmPrimitiveCreation creation(rpBrep->GetInfiniteRegion());
+    return creation.CreateTorus(10.0, 3.0, 0.0, 360.0, frame);
+}
+
+// The first notification of the call it is registered for tessellates m_pOther (a Brep of another context),
+// once the other thread's call is inside its callback too (each call then holds its own context).
+class sm_CrossContextProbe : public SmNotifyCallback
+{
+public:
+    SmBrep*              m_pOther = nullptr;
+    std::atomic<int>*    m_pArrived = nullptr;
+    std::atomic<bool>    m_bFired{false};
+    bool                 m_bBoth = false;
+    SmApiStatus          m_lNested = SM_SUCCESS;
+    SmStatus Execute(SmNotifyOperation, SmObject*, SmObject*, SmObject*, SmObject*) override
+    {
+        bool expected = false;
+        if (!m_bFired.compare_exchange_strong(expected, true))
+            return SM_SUCCESS;
+        ++*m_pArrived;
+        for (int ii = 0; ii < 10000 && m_pArrived->load() < 2; ++ii)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        m_bBoth = m_pArrived->load() >= 2;
+        SmFastTessellation mesh;
+        m_lNested = SmApiTessellateFast(m_pOther, mesh);
+        return SM_SUCCESS;
+    }
+};
+
+// Two threads tessellate Breps of two contexts, and each call's notification callback tessellates the other
+// context's Brep while the other thread's call holds that context. A nested call whose context is busy is
+// declined instead of waiting, so neither thread waits for the other (a watchdog fails the test after 60 s),
+// and both calls give their usual meshes.
+static SmStatus TestSmTessellateFastCrossContextCallbacks()
+{
+    SmContext* pContexts[2] = { SmApiGetOrCreateContext(), nullptr };
+    SmContext contextB;
+    pContexts[1] = &contextB;
+    SmBrep* breps[2] = { nullptr, nullptr };
+    SER(CreateTorusIn(*pContexts[0], 0.0, breps[0]));
+    std::unique_ptr<SmBrep> ownedA(breps[0]);
+    SER(CreateTorusIn(*pContexts[1], 50.0, breps[1]));
+    std::unique_ptr<SmBrep> ownedB(breps[1]);
+    if (breps[1]->GetContext() != pContexts[1])
+        return SM_ERR;
+    SmTessellationParams params;
+    params.dChordHeightTol = 0.002;
+    SmFastTessellation expected[2];
+    for (int ii = 0; ii < 2; ++ii)
+        SER(SmApiTessellateFast(breps[ii], expected[ii], params));
+
+    std::atomic<int> arrived{0};
+    sm_CrossContextProbe probes[2];
+    SmNotifyCallback* pOld[2];
+    for (int ii = 0; ii < 2; ++ii)
+    {
+        probes[ii].m_pOther = breps[1 - ii];
+        probes[ii].m_pArrived = &arrived;
+        pOld[ii] = pContexts[ii]->GetUserNotifyCallback();
+        pContexts[ii]->SetUserNotifyCallback(&probes[ii]);
+    }
+    std::mutex watchMutex;
+    std::condition_variable watchDone;
+    bool bDone = false;
+    std::thread watchdog([&] {
+        std::unique_lock<std::mutex> lock(watchMutex);
+        if (!watchDone.wait_for(lock, std::chrono::seconds(60), [&] { return bDone; }))
+        {
+            printf("TestSmTessellateFastCrossContextCallbacks: the two calls deadlocked\n");
+            fflush(stdout);
+            std::_Exit(1);
+        }
+    });
+    SmFastTessellation meshes[2];
+    SmApiStatus statuses[2] = { SM_ERR, SM_ERR };
+    std::thread threads[2];
+    for (int ii = 0; ii < 2; ++ii)
+        threads[ii] = std::thread([&, ii] { statuses[ii] = SmApiTessellateFast(breps[ii], meshes[ii], params); });
+    for (std::thread& thread : threads)
+        thread.join();
+    {
+        std::lock_guard<std::mutex> lock(watchMutex);
+        bDone = true;
+    }
+    watchDone.notify_all();
+    watchdog.join();
+    for (int ii = 0; ii < 2; ++ii)
+        pContexts[ii]->SetUserNotifyCallback(pOld[ii]);
+    for (int ii = 0; ii < 2; ++ii)
+        if (statuses[ii] != SM_SUCCESS || !SameFastTessellation(meshes[ii], expected[ii]) || !probes[ii].m_bFired)
+            return SM_ERR;
+    // both calls were inside their callbacks at once: both nested calls found the other context busy
+    if (probes[0].m_bBoth && probes[1].m_bBoth && (probes[0].m_lNested == SM_SUCCESS || probes[1].m_lNested == SM_SUCCESS))
         return SM_ERR;
     return SM_SUCCESS;
 }
@@ -1541,6 +1829,10 @@ SmStatus TestSmTessellate()
     SER(TestSmTessellateParams());
     SER(TestSmTessellateBoundaries());
     SER(TestSmTessellateFast());
+    SER(TestSmTessellateFastLeavesBrep());
+    SER(TestSmTessellateFastNotifyCallback());
+    SER(TestSmTessellateFastSharedContext());
+    SER(TestSmTessellateFastCrossContextCallbacks());
 
     SmApiCreateContext();
 

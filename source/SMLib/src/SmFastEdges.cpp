@@ -32,6 +32,7 @@
 #include "StdAfx.h"
 
 #include <SmFastEdges.h>
+#include <SmFastTessSrfCache.h>
 #include <SmTess.h>
 #include <SmBrep.h>
 #include <SmFace.h>
@@ -496,15 +497,100 @@ void sm_Degeneracy(const sm_Face & crF, const SmPoint2d & crUV, double dVertexTo
 /*******************************************************************//**
    F1: refinement trees and iso-line tests
 ***********************************************************************/
+// Where a face lies on its surface, for a surface of revolution curved both ways (torus, sphere), whose
+// refinement tree covers the whole revolution: the UV box of its edges' ends and three points between each
+// (projected along the loops, kept within half a period of the one before), widened by half its size and a
+// hundredth of the domain each way. FALSE when that is most of the surface anyway, the face has a seam, or a
+// point isn't on the surface. A face on a much larger surface (Booleans on tori) gets a tree subdivided
+// there only (SmFastTessSrfCache::m_sFastRegion), by the same tests.
+SmBoolean sm_FaceRegion(const sm_Context & crC, const sm_Face & crF, SmExtent2d & rRegion)
+{
+  const SM_TYPE eType = crF.pSurface->GetType();
+  if (eType != SmTorus_TYPE && eType != SmSphere_TYPE && eType != SmSurfOfRevolution_TYPE)
+    { return FALSE; }
+  SmExtent2d sBox;
+  SmPoint2d  sUV, sPrev;
+  bool       bFirst = true;
+  auto Project = [&](const SmPoint3d & crP)
+    {
+      double dBest = std::numeric_limits<double>::infinity();
+      for (int k = 0; bFirst && k < 25; k++)   // the first from the nearest of a 5 x 5 grid
+        {
+          const SmPoint2d sSeed(crF.sNatural.GetMin().x + crF.sNatural.XLength() * (k / 5 + 0.5) / 5.0,
+                                crF.sNatural.GetMin().y + crF.sNatural.YLength() * (k % 5 + 0.5) / 5.0);
+          SmPoint3d sS;
+          if (crF.pSurface->EvaluatePoint(sSeed, sS) == SM_SUCCESS && sS.DistanceBetweenSquared(crP) < dBest)
+            {
+              dBest = sS.DistanceBetweenSquared(crP);
+              sUV   = sSeed;
+            }
+        }
+      double dDist = 0.0;
+      if (!sm_Newton(crF, crP, sUV, dDist) || !(dDist <= crF.dInvTol))
+        { return false; }
+      SmPoint2d sAt = sUV;
+      for (int d = 0; d < 2 && !bFirst; d++)
+        {
+          const double dP = crF.aPeriod[d];
+          if (dP > 0.0)
+            { ((d == 0) ? sAt.x : sAt.y) += dP * std::floor(((d == 0) ? sPrev.x - sAt.x : sPrev.y - sAt.y) / dP + 0.5); }
+        }
+      sBox.AddPoint2d(sAt);
+      sPrev  = sAt;
+      bFirst = false;
+      return true;
+    };
+  for (const std::vector<int> & crLoop : crF.sLoops)
+    {
+      for (int lCE : crLoop)
+        {
+          const sm_Coedge & crCE = crC.sCoedges[lCE];
+          const sm_Edge   & crE  = crC.sEdges[crCE.lEdge];
+          if (crCE.bSeam || !Project(crC.sVertexPoints[crCE.bReversed ? crE.lV1 : crE.lV0]))
+            { return FALSE; }   // (a seam: the face goes around)
+          for (int k = 1; k < 4 && !crE.bDegenerate && crE.cpCurve != NULL; k++)
+            {
+              SmPoint3d sP;
+              const double t = crCE.bReversed ? crE.t1 - (crE.t1 - crE.t0) * k / 4.0 : crE.t0 + (crE.t1 - crE.t0) * k / 4.0;
+              if (crE.cpCurve->EvaluatePoint(t, sP) != SM_SUCCESS || !Project(sP))
+                { return FALSE; }
+            }
+        }
+    }
+  if (bFirst)
+    { return FALSE; }
+  double aLo[2] = {sBox.GetMin().x, sBox.GetMin().y}, aHi[2] = {sBox.GetMax().x, sBox.GetMax().y};
+  for (int d = 0; d < 2; d++)
+    {
+      const double dMin = (d == 0) ? crF.sNatural.GetMin().x : crF.sNatural.GetMin().y;
+      const double dMax = (d == 0) ? crF.sNatural.GetMax().x : crF.sNatural.GetMax().y;
+      const double dMargin = std::max(0.5 * (aHi[d] - aLo[d]), 0.01 * (dMax - dMin));
+      aLo[d] -= dMargin;
+      aHi[d] += dMargin;
+      if (crF.aPeriod[d] <= 0.0 || aHi[d] - aLo[d] >= 0.5 * crF.aPeriod[d])
+        {
+          aLo[d] = (crF.aPeriod[d] <= 0.0) ? std::max(aLo[d], dMin) : dMin;
+          aHi[d] = (crF.aPeriod[d] <= 0.0) ? std::min(aHi[d], dMax) : dMax;
+        }
+    }
+  if ((aHi[0] - aLo[0]) * (aHi[1] - aLo[1]) >= 0.25 * crF.sNatural.XLength() * crF.sNatural.YLength())
+    { return FALSE; }
+  rRegion.SetMinMax(SmPoint2d(aLo[0], aLo[1]), SmPoint2d(aHi[0], aHi[1]));
+  return TRUE;
+}
+
 SmStatus sm_BuildTree(sm_Context & rC, sm_Face & rF, std::vector<SmFastLeaf> & rLeaves)
 {
   const SmTessellationParams & crP = rC.sParams;
-  SmTessSrfCache * pSC = new (*rF.pFace->GetContext())
-    SmTessSrfCache(rF.pFace, NULL, rC.pDriver, crP.dChordHeightTol, crP.dSurfaceAngleTolDeg * SM_PI / 180.0,
-                   crP.dMaxEdgeLength, 0.0, 0.001, crP.dMaxAspectRatio);
+  SmFastTessSrfCache * pSC = new (*rF.pFace->GetContext())
+    SmFastTessSrfCache(rF.pFace, rC.pDriver, crP.dChordHeightTol, crP.dSurfaceAngleTolDeg * SM_PI / 180.0,
+                       crP.dMaxEdgeLength, 0.0, 0.001, crP.dMaxAspectRatio);
   if (pSC == NULL)
     { return SM_ERR; }
   pSC->SetTessellationAlgorithm(SM_TA_FASTER_TESSELLATION);
+  pSC->m_bFastRegion = sm_FaceRegion(rC, rF, pSC->m_sFastRegion);
+  pSC->m_adFastPeriod[0] = rF.aPeriod[0];
+  pSC->m_adFastPeriod[1] = rF.aPeriod[1];
   if (pSC->BuildTree() != SM_SUCCESS)
     {
       delete pSC;
