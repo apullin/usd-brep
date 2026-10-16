@@ -378,6 +378,93 @@ SmBoolean bDebugMe = FALSE ;
 } // end SmSurfOfRevolution::AdjustSTEPUVDomain
 
 /*******************************************************************//**
+PURPOSE: MakeNurb() then AdjustSTEPUVDomain(crNewSTEPUVDomain) on a surface
+    its constructor just built (no MakeNurb() yet), making the Nurb once.
+
+NOTES: Returns TRUE when done: bit for bit the surface of those two calls.
+       Returns FALSE with rbTouched = FALSE when it left the surface as it
+       was (make those two calls), with rbTouched = TRUE when the surface may
+       be half done (discard it).
+       When the domain changes, AdjustSTEPUVDomain() rebuilds the Nurb and
+       the PolarConverter from m_pGenCurve, m_vAnalUVDomain, m_vPosition and
+       m_bSwapUV: the first Nurb and PolarConverter, and Reparameterize()'s
+       edits of them, go unused, provided that
+       1. the first MakeNurb() leaves m_pGenCurve alone (no trim: its STEP
+          interval is the surface V interval) and copies it unrotated (the
+          sweep starts at 0),
+       2. the first MakeNurb() can't fail: CreateSurfOfRevolution() finds a
+          GenCurve control point off the rotation axis, and
+       3. the last RebuildPolarConverter() sets up the whole PolarConverter.
+***********************************************************************/
+SmBoolean SmSurfOfRevolution::MakeNurbOnSTEPUVDomain
+  (const SmExtent2d & crNewSTEPUVDomain,  // in : new desired domain, as AdjustSTEPUVDomain()
+   SmBoolean        & rbTouched)          // out: FALSE = surface left as it was
+{
+  rbTouched = FALSE ;
+  if (   m_pNurb != NULL
+      || m_pGenCurve == NULL
+      || m_pGenCurve->GetGwNurbPointer() == NULL)
+    { return FALSE ; }
+
+  // AdjustSTEPUVDomain() no work case: nothing to save
+  if(   crNewSTEPUVDomain.IsContainedBy( m_vAnalUVDomain, SM_EFF_ZERO )
+     && m_vAnalUVDomain.IsContainedBy( crNewSTEPUVDomain, SM_EFF_ZERO ))
+    { return FALSE ; }
+
+  // 1. as MakeNurbWithSweepParams()
+  SmExtent1d sSurfGenStepIvl  = m_vAnalUVDomain.GetVInterval() ;
+  SmExtent1d sGenCurveStepIvl = m_pGenCurve->GetSTEPInterval() ;
+  if(   !sSurfGenStepIvl.IsContainedBy(sGenCurveStepIvl)
+     || !sGenCurveStepIvl.IsContainedBy(sSurfGenStepIvl)
+     || smos_Fabs( m_vAnalUVDomain.GetUInterval().GetMin() ) > SM_EFF_ZERO)
+    { return FALSE ; }
+
+  // 2. as CreateSurfOfRevolution() on the GenCurve copy (same control points)
+  SmTArray<SmPoint3d> sCrvCtrlPts ;
+  SmTArray<double>    sCrvWeights ;
+  if (m_pGenCurve->GetControlPolygon(sCrvCtrlPts, sCrvWeights) != SM_SUCCESS)
+    { return FALSE ; }
+  const SmPoint3d & crOrigin = m_vPosition.GetOriginRef() ;
+  SmVector3d        sAxisDir = m_vPosition.GetZAxis() ;
+  if (sAxisDir.Unitize() != SM_SUCCESS)
+    { return FALSE ; }
+  SmBoolean bOffAxis = FALSE ;
+  for (ULONG i=0; i<sCrvCtrlPts.GetSize() && !bOffAxis; i++)
+    {
+      SmPoint3d sPnt        = sCrvCtrlPts[i];
+      double    dScaledZero = SM_EFF_ZERO * (1.0 + sPnt.GetMaxDimension());
+      SmVector3d sXVec   = sPnt - crOrigin;
+      double     dT      = sXVec.Dot(sAxisDir);
+      SmPoint3d  sCenter = crOrigin + dT*sAxisDir;
+      sXVec              = sPnt - sCenter;
+      double     dRadius = sXVec.Length();
+      bOffAxis = (dRadius < dScaledZero) ? FALSE : TRUE ;
+    }
+  if (!bOffAxis)
+    { return FALSE ; }
+
+  // AdjustSTEPUVDomain() without Reparameterize()'s work on the Nurb and the
+  // PolarConverter, which MakeNurb() then replaces
+  rbTouched = TRUE ;
+  m_vAnalUVDomain = crNewSTEPUVDomain;
+  if (m_pGenCurve->AdjustSTEPInterval( m_vAnalUVDomain.GetVInterval() ) != SM_SUCCESS)
+    { return FALSE ; }
+  SmExtent2d sNurbDomain = crNewSTEPUVDomain ;
+  if(m_bSwapUV)
+    { sNurbDomain.Transpose() ; }
+  Notify(SM_NO_PRE_EDIT, this, SM_NO_GET_OWNER(this), NULL);
+  m_pGenCurve->EditParameterization(m_bSwapUV ? sNurbDomain.GetUInterval() : sNurbDomain.GetVInterval()) ;
+  Notify(SM_NO_POST_EDIT, this, SM_NO_GET_OWNER(this), NULL);
+  if (MakeNurb() != SM_SUCCESS)
+    { return FALSE ; }
+
+  // 3. nothing left of the PolarConverter Reparameterize() would have built
+  return (   m_pNurb != NULL
+          && m_vPolarConverter.IsPolarConversionPossible()) ? TRUE : FALSE ;
+
+} // end SmSurfOfRevolution::MakeNurbOnSTEPUVDomain
+
+/*******************************************************************//**
 PURPOSE: Copy a Surface Of Revolution.
 
 NOTES:

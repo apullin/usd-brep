@@ -3305,8 +3305,12 @@ SmBoolean bDebugMe = FALSE;
                     sYAxis                                           // y axis (axis cross refDirection)
                 );
 
+                // CreateCanonical then AdjustSTEPUVDomain, both in one step (bAdjusted) when that can build the NURB once
                 SmSphere * pSphere = NULL ;
-                SmStatus stat = SmSphere::CreateCanonical(*prSmBrepData_ii->GetContext(), sOrigin, dRadius, pSphere) ;
+                SmBoolean bAdjusted = FALSE ;
+                SmStatus stat = sDomain.IsBounded()
+                              ? SmSphere::CreateCanonicalOnSTEPUVDomain(*prSmBrepData_ii->GetContext(), sOrigin, dRadius, sDomain, pSphere, bAdjusted)
+                              : SmSphere::CreateCanonical(*prSmBrepData_ii->GetContext(), sOrigin, dRadius, pSphere) ;
                 SmObjDelete sSphereCleanup(pSphere);
                 if (stat != SM_SUCCESS || pSphere == NULL)
                   {
@@ -3316,7 +3320,7 @@ SmBoolean bDebugMe = FALSE;
                     prSmBrepData_ii = NULL;
                     return (stat != SM_SUCCESS) ? stat : SM_ERR;
                   }
-                if (sDomain.IsBounded())
+                if (sDomain.IsBounded() && !bAdjusted)
                   {
                     SmStatus adjStat = pSphere->AdjustSTEPUVDomain(sDomain) ;
                     if (adjStat != SM_SUCCESS)
@@ -3401,8 +3405,12 @@ SmBoolean bDebugMe = FALSE;
                     sYAxis
                 );
 
+                // CreateCanonical then AdjustSTEPUVDomain, both in one step (bAdjusted) when that can build the NURB once
                 SmCylinder * pCylinder = NULL ;
-                SmStatus stat = SmCylinder::CreateCanonical(*prSmBrepData_ii->GetContext(), sPlacement, dRadius, pCylinder) ;
+                SmBoolean bAdjusted = FALSE ;
+                SmStatus stat = sDomain.IsBounded()
+                              ? SmCylinder::CreateCanonicalOnSTEPUVDomain(*prSmBrepData_ii->GetContext(), sPlacement, dRadius, sDomain, pCylinder, bAdjusted)
+                              : SmCylinder::CreateCanonical(*prSmBrepData_ii->GetContext(), sPlacement, dRadius, pCylinder) ;
                 SmObjDelete sCylinderCleanup(pCylinder);
                 if (stat != SM_SUCCESS || pCylinder == NULL)
                   {
@@ -3412,7 +3420,7 @@ SmBoolean bDebugMe = FALSE;
                     prSmBrepData_ii = NULL;
                     return (stat != SM_SUCCESS) ? stat : SM_ERR;
                   }
-                if (sDomain.IsBounded())
+                if (sDomain.IsBounded() && !bAdjusted)
                   {
                     SmStatus adjStat = pCylinder->AdjustSTEPUVDomain(sDomain) ;
                     if (adjStat != SM_SUCCESS)
@@ -3538,8 +3546,12 @@ SmBoolean bDebugMe = FALSE;
                     sYAxis
                 );
 
+                // CreateCanonical then AdjustSTEPUVDomain, both in one step (bAdjusted) when that can build the NURB once
                 SmTorus * pTorus = NULL ;
-                SmStatus stat = SmTorus::CreateCanonical(*prSmBrepData_ii->GetContext(), sPlacement, dMajorRadius, dMinorRadius, pTorus) ;
+                SmBoolean bAdjusted = FALSE ;
+                SmStatus stat = sDomain.IsBounded()
+                              ? SmTorus::CreateCanonicalOnSTEPUVDomain(*prSmBrepData_ii->GetContext(), sPlacement, dMajorRadius, dMinorRadius, sDomain, pTorus, bAdjusted)
+                              : SmTorus::CreateCanonical(*prSmBrepData_ii->GetContext(), sPlacement, dMajorRadius, dMinorRadius, pTorus) ;
                 SmObjDelete sTorusCleanup(pTorus);
                 if (stat != SM_SUCCESS || pTorus == NULL)
                   {
@@ -3550,7 +3562,7 @@ SmBoolean bDebugMe = FALSE;
                     return (stat != SM_SUCCESS) ? stat : SM_ERR;
                   }
 
-                if (sDomain.IsBounded())
+                if (sDomain.IsBounded() && !bAdjusted)
                   {
                     SmStatus adjStat = pTorus->AdjustSTEPUVDomain(sDomain) ;
                     if (adjStat != SM_SUCCESS)

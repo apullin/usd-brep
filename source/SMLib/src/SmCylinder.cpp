@@ -187,6 +187,59 @@ SmStatus SmCylinder::CreateCanonical
 } // end SmCylinder::CreateCanonical
 
 /*******************************************************************//**
+PURPOSE: CreateCanonical(), then AdjustSTEPUVDomain() without building the
+    infinite cylinder's Nurb first.
+
+NOTES: rbAdjusted = TRUE : bit for bit CreateCanonical() then
+                           AdjustSTEPUVDomain(crSTEPUVDomain)'s cylinder.
+       rbAdjusted = FALSE: CreateCanonical()'s result and status; call
+                           AdjustSTEPUVDomain() next.
+       See SmSurfOfRevolution::MakeNurbOnSTEPUVDomain().
+***********************************************************************/
+SmStatus SmCylinder::CreateCanonicalOnSTEPUVDomain
+  (const SmContext        & crContext,
+   const SmAxis2Placement & crOrigin,
+   double                   dRadius,
+   const SmExtent2d       & crSTEPUVDomain,
+   SmCylinder            *& rpNewCylinder,
+   SmBoolean              & rbAdjusted)
+{
+  rbAdjusted = FALSE;
+  if (!(dRadius > SM_EFF_ZERO))
+    { return CreateCanonical(crContext, crOrigin, dRadius, rpNewCylinder); }
+
+  // as CreateCanonical()
+  rpNewCylinder = new (crContext) SmCylinder(crOrigin.GetOriginRef(),
+                                             crOrigin.GetXAxisRef(),
+                                             crOrigin.GetYAxisRef(),
+                                             dRadius);
+  NER(rpNewCylinder);
+
+  SmBoolean bTouched = FALSE;
+  if (rpNewCylinder->MakeNurbOnSTEPUVDomain(crSTEPUVDomain, bTouched))
+    {
+      rbAdjusted = TRUE;
+      return SM_SUCCESS;
+    }
+  if (bTouched)
+    {
+      delete rpNewCylinder; rpNewCylinder = NULL;
+      return CreateCanonical(crContext, crOrigin, dRadius, rpNewCylinder);
+    }
+
+  // the rest of CreateCanonical()
+  if (rpNewCylinder->MakeNurb() != SM_SUCCESS || rpNewCylinder->GetGwNurbPointer() == NULL)
+    {
+      delete rpNewCylinder; rpNewCylinder = NULL;
+      SE_MSG(SM_ERR, _T("SmCylinder::CreateCanonical: failed to build NURB representation")) ;
+      return SM_ERR;
+    }
+
+  return SM_SUCCESS;
+
+} // end SmCylinder::CreateCanonicalOnSTEPUVDomain
+
+/*******************************************************************//**
 PURPOSE: Method to get canonical data from Cylinder object.
 
 NOTES: 

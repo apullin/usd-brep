@@ -219,6 +219,68 @@ SmStatus SmSphere::CreateCanonical
 } // end SmSphere::CreateCanonical
 
 /*******************************************************************//**
+PURPOSE: CreateCanonical(), then AdjustSTEPUVDomain() without building the
+    whole sphere's Nurb first.
+
+NOTES: rbAdjusted = TRUE : bit for bit CreateCanonical() then
+                           AdjustSTEPUVDomain(crSTEPUVDomain)'s sphere.
+       rbAdjusted = FALSE: CreateCanonical()'s result and status; call
+                           AdjustSTEPUVDomain() next.
+       See SmSurfOfRevolution::MakeNurbOnSTEPUVDomain().
+***********************************************************************/
+SmStatus SmSphere::CreateCanonicalOnSTEPUVDomain
+  (const SmContext        & crContext,
+   const SmAxis2Placement & crOrigin,
+   double                   dRadius,
+   const SmExtent2d       & crSTEPUVDomain,
+   SmSphere              *& rpNewSphere,
+   SmBoolean              & rbAdjusted)
+{
+  rbAdjusted = FALSE;
+
+  // as CreateCanonical()
+  const SmBoolean bInsideOut = (dRadius < 0.0) ? TRUE : FALSE;
+  const double    dAbsRadius = fabs(dRadius);
+  if (!(dAbsRadius > SM_EFF_ZERO))
+    { return CreateCanonical(crContext, crOrigin, dRadius, rpNewSphere); }
+  SmExtent2d sAnalUVDomain(SmPoint2d(  0.0,-90.0),
+                           SmPoint2d(360.0, 90.0));
+  rpNewSphere = new (crContext) SmSphere
+                 (crOrigin.GetOriginRef(),
+                  crOrigin.GetXAxisRef(),
+                  crOrigin.GetYAxisRef(),
+                  sAnalUVDomain,
+                  dAbsRadius,
+                  FALSE,       // bSwapUV
+                  bInsideOut,  // negative radius -> inside-out sphere
+                  NULL);       // pOptCircleNurb
+  NER(rpNewSphere);
+
+  SmBoolean bTouched = FALSE;
+  if (rpNewSphere->MakeNurbOnSTEPUVDomain(crSTEPUVDomain, bTouched))
+    {
+      rbAdjusted = TRUE;
+      return SM_SUCCESS;
+    }
+  if (bTouched)
+    {
+      delete rpNewSphere; rpNewSphere = NULL;
+      return CreateCanonical(crContext, crOrigin, dRadius, rpNewSphere);
+    }
+
+  // the rest of CreateCanonical()
+  if (rpNewSphere->MakeNurb() != SM_SUCCESS || rpNewSphere->GetGwNurbPointer() == NULL)
+    {
+      delete rpNewSphere; rpNewSphere = NULL;
+      SE_MSG(SM_ERR, _T("SmSphere::CreateCanonical: failed to build NURB representation")) ;
+      return SM_ERR;
+    }
+
+  return SM_SUCCESS;
+
+} // end SmSphere::CreateCanonicalOnSTEPUVDomain
+
+/*******************************************************************//**
 PURPOSE: Method to get canonical data from Cone object.
 
 NOTES:

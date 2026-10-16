@@ -160,6 +160,18 @@ public:
     SmCylinder            *& rpNewCylinder    // out: new infinite cylinder                                  <br>
   ) ; 
 
+  // CreateCanonical(), then AdjustSTEPUVDomain(crSTEPUVDomain) building the Nurb once (rbAdjusted = TRUE),
+  // bit for bit the same cylinder; rbAdjusted = FALSE: CreateCanonical()'s result, call AdjustSTEPUVDomain() next
+  static SmStatus CreateCanonicalOnSTEPUVDomain
+  (
+    const SmContext        & crContext,       ///< [in] : as CreateCanonical()                               <br>
+    const SmAxis2Placement & crOrigin,        ///< [in] : as CreateCanonical()                               <br>
+    double                   dRadius,         ///< [in] : as CreateCanonical()                               <br>
+    const SmExtent2d       & crSTEPUVDomain,  ///< [in] : as AdjustSTEPUVDomain()                            <br>
+    SmCylinder            *& rpNewCylinder,   ///< [out]: as CreateCanonical()                               <br>
+    SmBoolean              & rbAdjusted       ///< [out]: TRUE = AdjustSTEPUVDomain(crSTEPUVDomain) done     <br>
+  ) ;
+
   // simple access
   virtual SmExtent2d GetMaxAnalyticDomain() const;
 

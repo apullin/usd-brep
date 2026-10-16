@@ -224,6 +224,63 @@ SmStatus SmTorus::CreateCanonical
 } // end SmTorus::CreateCanonical
 
 /*******************************************************************//**
+PURPOSE: CreateCanonical() with its default options, then AdjustSTEPUVDomain()
+    without building the whole torus' Nurb first.
+
+NOTES: rbAdjusted = TRUE : bit for bit CreateCanonical() then
+                           AdjustSTEPUVDomain(crSTEPUVDomain)'s torus.
+       rbAdjusted = FALSE: CreateCanonical()'s result and status; call
+                           AdjustSTEPUVDomain() next.
+       See SmSurfOfRevolution::MakeNurbOnSTEPUVDomain().
+***********************************************************************/
+SmStatus SmTorus::CreateCanonicalOnSTEPUVDomain
+ (const SmContext        & crContext,
+  const SmAxis2Placement & crOrigin,
+  double                   dMajorRadius,
+  double                   dMinorRadius,
+  const SmExtent2d       & crSTEPUVDomain,
+  SmTorus               *& rpNewTorus,
+  SmBoolean              & rbAdjusted)
+{
+  rbAdjusted = FALSE;
+  if (!(dMinorRadius > SM_EFF_ZERO) || !(dMajorRadius > SM_EFF_ZERO))
+    { return CreateCanonical(crContext, crOrigin, dMajorRadius, dMinorRadius, rpNewTorus); }
+
+  // as CreateCanonical()
+  SmExtent2d sAnalUVDomain = SmExtent2d(0.0, 0.0, 360.0, 360.0);
+  rpNewTorus = new (crContext) SmTorus(crOrigin.GetOriginRef(),
+                                       crOrigin.GetXAxisRef(),
+                                       crOrigin.GetYAxisRef(),
+                                       sAnalUVDomain,
+                                       dMajorRadius, dMinorRadius,
+                                       FALSE, FALSE, NULL );
+  NER(rpNewTorus);
+
+  SmBoolean bTouched = FALSE;
+  if (rpNewTorus->MakeNurbOnSTEPUVDomain(crSTEPUVDomain, bTouched))
+    {
+      rbAdjusted = TRUE;
+      return SM_SUCCESS;
+    }
+  if (bTouched)
+    {
+      delete rpNewTorus; rpNewTorus = NULL;
+      return CreateCanonical(crContext, crOrigin, dMajorRadius, dMinorRadius, rpNewTorus);
+    }
+
+  // the rest of CreateCanonical()
+  if (rpNewTorus->MakeNurb() != SM_SUCCESS || rpNewTorus->GetGwNurbPointer() == NULL)
+    {
+      delete rpNewTorus; rpNewTorus = NULL;
+      SE_MSG(SM_ERR, _T("SmTorus::CreateCanonical: failed to build NURB representation")) ;
+      return SM_ERR;
+    }
+
+  return SM_SUCCESS;
+
+} // end SmTorus::CreateCanonicalOnSTEPUVDomain
+
+/*******************************************************************//**
 PURPOSE: Create an offset torus for the torus.
 
 NOTES: 

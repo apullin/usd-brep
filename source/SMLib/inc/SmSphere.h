@@ -166,6 +166,18 @@ public:
     SmSphere              *& rpNewSphere         ///< [out]: new object                                           <br>
   );
 
+  // CreateCanonical(), then AdjustSTEPUVDomain(crSTEPUVDomain) building the Nurb once (rbAdjusted = TRUE),
+  // bit for bit the same sphere; rbAdjusted = FALSE: CreateCanonical()'s result, call AdjustSTEPUVDomain() next
+  static SmStatus CreateCanonicalOnSTEPUVDomain
+  (
+    const SmContext        & crContext,          ///< [in] : as CreateCanonical()                                 <br>
+    const SmAxis2Placement & crOrigin,           ///< [in] : as CreateCanonical()                                 <br>
+    double                   dRadius,            ///< [in] : as CreateCanonical()                                 <br>
+    const SmExtent2d       & crSTEPUVDomain,     ///< [in] : as AdjustSTEPUVDomain()                              <br>
+    SmSphere              *& rpNewSphere,        ///< [out]: as CreateCanonical()                                 <br>
+    SmBoolean              & rbAdjusted          ///< [out]: TRUE = AdjustSTEPUVDomain(crSTEPUVDomain) done       <br>
+  );
+
   // create offset surface - Out Surf->Domain(s) will equal input surface domain
   virtual SmStatus CreateOffsetSurface
   (

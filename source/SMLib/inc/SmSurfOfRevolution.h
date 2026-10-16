@@ -114,6 +114,10 @@ protected:
   // maintenance
   SmStatus RebuildPolarConverter() ;
 
+  // on a just constructed surface: MakeNurb() then AdjustSTEPUVDomain(crNewSTEPUVDomain), making the Nurb once
+  //   FALSE: not done - rbTouched = FALSE: surface left as it was, TRUE: half done, discard it
+  SmBoolean MakeNurbOnSTEPUVDomain(const SmExtent2d & crNewSTEPUVDomain, SmBoolean & rbTouched) ;
+
 public:
   // destructor
   virtual ~SmSurfOfRevolution() ;

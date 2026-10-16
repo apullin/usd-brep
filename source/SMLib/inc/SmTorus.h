@@ -172,6 +172,20 @@ public:
     const SmExtent2d       * cpOptAnalUVDomain = NULL   ///< [in ]: Analytic UV Domain [u=rotation in degrees, v=genCurve param]
   );
 
+  // CreateCanonical() with its default options, then AdjustSTEPUVDomain(crSTEPUVDomain) building the Nurb once
+  // (rbAdjusted = TRUE), bit for bit the same torus; rbAdjusted = FALSE: CreateCanonical()'s result, call
+  // AdjustSTEPUVDomain() next
+  static SmStatus CreateCanonicalOnSTEPUVDomain
+  (
+    const SmContext        & crContext,                 ///< [in ]: as CreateCanonical()                                                <br>
+    const SmAxis2Placement & crOrigin,                  ///< [in ]: as CreateCanonical()                                                <br>
+    double                   dMajorRadius,              ///< [in ]: as CreateCanonical()                                                <br>
+    double                   dMinorRadius,              ///< [in ]: as CreateCanonical()                                                <br>
+    const SmExtent2d       & crSTEPUVDomain,            ///< [in ]: as AdjustSTEPUVDomain()                                             <br>
+    SmTorus               *& rpNewTorus,                ///< [out]: as CreateCanonical()                                                <br>
+    SmBoolean              & rbAdjusted                 ///< [out]: TRUE = AdjustSTEPUVDomain(crSTEPUVDomain) done                      <br>
+  );
+
   // create offset surface - Out Surf->Domain(s) may be trimmed but not scaled
   virtual SmStatus CreateOffsetSurface
   (
