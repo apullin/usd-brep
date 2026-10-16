@@ -10,6 +10,7 @@
 #include "StdAfx.h"
 
 #include <SmTessFast.h>
+#include <SmFastFace.h>
 #include <SmTess.h>
 #include <SmBrep.h>
 #include <SmFace.h>
@@ -53,7 +54,6 @@ double sm_Ms(sm_Clock::time_point sStart, sm_Clock::time_point sEnd)
   return std::chrono::duration<double, std::milli>(sEnd - sStart).count();
 }
 
-SmFastFaceTriangulator gs_pfnTrimmedTriangulator = NULL;
 
 // surface tessellation driver of SmTessellateFast(): its type selects SmTessSrfCache::BuildTreeFast()
 class SmFastSurfaceTessDriver : public SmSurfaceTessDriver
@@ -505,14 +505,18 @@ SmStatus SmTriangulateRectangularFace(const SmFastFaceInput & crIn, SmFastFaceOu
     }
 
   // SubdivideByBlock() computes the splits of each block on its own, so the leaves of neighbor blocks
-  // can disagree in the last bits about a shared split. Use one value per split: values closer than
-  // 1e-12 of the domain size become the smallest of them (the domain bounds win), and leaves that
-  // collapse to zero width are dropped.
+  // can disagree about a shared split, in the last bits or (with a maximum edge length: equally spaced
+  // splits per block) by a little, which would leave slivers at the T-junctions. Use one value per
+  // split: values closer than 1e-12 of the domain size or 1% of the narrowest leaf become the smallest
+  // of them (the domain bounds win), and leaves that collapse to zero width are dropped.
     {
       const bool bPar = crIn.bParallelSafe ? true : false;
       auto Canonical = [&](double SmLeafRect::*pLo, double SmLeafRect::*pHi, double dMin, double dMax) -> SmBoolean
         {
-          const double dEps = 1e-12 * (dMax - dMin);
+          double dMinExtent = dMax - dMin;
+          for (const SmLeafRect & crLeaf : sLeaves)
+            { dMinExtent = std::min(dMinExtent, crLeaf.*pHi - crLeaf.*pLo); }
+          const double dEps = std::max(1e-12 * (dMax - dMin), 0.01 * dMinExtent);
           std::vector<double> sValues;
           sValues.reserve(sLeaves.size() * 2);
           for (const SmLeafRect & crLeaf : sLeaves)
@@ -958,23 +962,133 @@ SmStatus SmTriangulateRectangularFace(const SmFastFaceInput & crIn, SmFastFaceOu
 /*******************************************************************//**
 PURPOSE: The per-face dispatcher of SmTessellateFast().
 ***********************************************************************/
+/*******************************************************************//**
+   SmTriangulateTrimmedFace() (track G3) on this interface: the refinement
+   tree's leaves as SmTrimLeaf rectangles, triangles and normals in the
+   surface's orientation (the pipeline reverses reversed faces), the UV of
+   each triangle corner for the pipeline's corner normals.
+***********************************************************************/
+SmStatus SmTriangulateTrimmedFastFace(const SmFastFaceInput & crIn, SmFastFaceOutput & rOut)
+{
+  thread_local SmTrimFaceInput  tIn;
+  thread_local SmTrimFaceOutput tOut;
+  rOut.eStatus  = SM_ERR;
+  rOut.eFailure = SM_FF_NONE;
+  tIn.cpFace                      = crIn.cpFace;
+  tIn.cpSurface                   = crIn.cpSurface;
+  tIn.sParams.dChordHeightTol     = crIn.sParams.dChordHeightTol;
+  tIn.sParams.dCurveAngleTolDeg   = crIn.sParams.dCurveAngleTolDeg;
+  tIn.sParams.dSurfaceAngleTolDeg = crIn.sParams.dSurfaceAngleTolDeg;
+  tIn.sParams.dMaxEdgeLength      = crIn.sParams.dMaxEdgeLength;
+  tIn.sParams.dMaxAspectRatio     = crIn.sParams.dMaxAspectRatio;
+  tIn.dTolerance                  = crIn.dTolerance;
+  tIn.bSurfaceOrientation         = true;
+  tIn.bTriangleUVs                = true;
+  tIn.sLoops.resize(crIn.sLoops.size());
+  for (size_t ii = 0; ii < crIn.sLoops.size(); ii++)
+    {
+      const std::vector<SmFastLoopVertex> & crLoop = crIn.sLoops[ii];
+      std::vector<SmTrimLoopVertex>       & rLoop  = tIn.sLoops[ii];
+      rLoop.resize(crLoop.size());
+      for (size_t kk = 0; kk < crLoop.size(); kk++)
+        {
+          rLoop[kk].dU     = crLoop[kk].dU;
+          rLoop[kk].dV     = crLoop[kk].dV;
+          rLoop[kk].sPoint = crLoop[kk].sPoint;
+          rLoop[kk].lId    = crLoop[kk].lId;
+        }
+    }
+  tIn.sInteriorSamples = crIn.sInteriorSamples;
+  tIn.sLeaves.clear();
+  const SmTree     * cpTree = crIn.cpCache ? crIn.cpCache->GetBuiltTree() : NULL;
+  const SmTreeNode * cpTop  = cpTree ? cpTree->GetTopNode() : NULL;
+  if (cpTop != NULL)
+    {
+      thread_local std::vector<const SmTreeNode *> tStack;
+      tStack.assign(1, cpTop);
+      while (!tStack.empty())
+        {
+          const SmTreeNode * cpNode = tStack.back();
+          tStack.pop_back();
+          if (cpNode->m_pChild1 != NULL || cpNode->m_pChild2 != NULL)
+            {
+              if (cpNode->m_pChild2 != NULL) { tStack.push_back(cpNode->m_pChild2); }
+              if (cpNode->m_pChild1 != NULL) { tStack.push_back(cpNode->m_pChild1); }
+              continue;
+            }
+          if (cpNode->m_pData == NULL)
+            { continue; }
+          const SmExtent2d & crD = ((const SmBezierAux2d *)cpNode->m_pData)->m_sUVDomain;
+          SmTrimLeaf sLeaf;
+          sLeaf.dU0 = crD.GetMin().x;
+          sLeaf.dV0 = crD.GetMin().y;
+          sLeaf.dU1 = crD.GetMax().x;
+          sLeaf.dV1 = crD.GetMax().y;
+          tIn.sLeaves.push_back(sLeaf);
+        }
+    }
+  if (SmTriangulateTrimmedFace(tIn, tOut) != SM_SUCCESS || tOut.eStatus != SM_SUCCESS)
+    {
+      const SmTrimFaceFailure eFailure = tOut.eFailure;
+      rOut.eFailure = (   eFailure == SM_TF_LOOP_ORIENTATION || eFailure == SM_TF_LOOP_INTERSECTION
+                       || eFailure == SM_TF_DUPLICATE_POINT  || eFailure == SM_TF_BAD_INPUT) ? SM_FF_LOOPS : SM_FF_OTHER;
+      return SM_ERR;
+    }
+  // A periodic seam (a vertex at two places of the loops, not a pole run) where the surface creases: one
+  // normal per vertex and face, as SMLib's output and the checks have, can't suit both sides; leave such
+  // faces to SMLib, as SmTriangulateRectangularFace() does.
+    {
+      struct Occurrence { long lId; size_t lLoop, lPos; };
+      thread_local std::vector<Occurrence> tOccurrences;
+      tOccurrences.clear();
+      for (size_t ii = 0; ii < tIn.sLoops.size(); ii++)
+        {
+          const std::vector<SmTrimLoopVertex> & crLoop = tIn.sLoops[ii];
+          const size_t lCount = crLoop.size();
+          for (size_t kk = 0; kk < lCount; kk++)
+            {
+              const long lId = crLoop[kk].lId;
+              if (lCount > 1 && (crLoop[(kk + 1) % lCount].lId == lId || crLoop[(kk + lCount - 1) % lCount].lId == lId))
+                { continue; }  // a pole run
+              tOccurrences.push_back({lId, ii, kk});
+            }
+        }
+      std::sort(tOccurrences.begin(), tOccurrences.end(), [](const Occurrence & a, const Occurrence & b)
+        { return a.lId < b.lId || (a.lId == b.lId && (a.lLoop < b.lLoop || (a.lLoop == b.lLoop && a.lPos < b.lPos))); });
+      for (size_t ii = 0; ii < tOccurrences.size(); ii++)
+        {
+          for (size_t jj = ii + 1; jj < tOccurrences.size() && tOccurrences[jj].lId == tOccurrences[ii].lId; jj++)
+            {
+              const SmVector3d & crA = tOut.sLoopNormals[tOccurrences[ii].lLoop][tOccurrences[ii].lPos];
+              const SmVector3d & crB = tOut.sLoopNormals[tOccurrences[jj].lLoop][tOccurrences[jj].lPos];
+              if (crA.Dot(crB) < 0.98480775301220802)  // cos(10 deg)
+                {
+                  rOut.eFailure = SM_FF_OTHER;
+                  return SM_ERR;
+                }
+            }
+        }
+    }
+  rOut.sNewUV.swap(tOut.sNewUV);
+  rOut.sNewPoints.swap(tOut.sNewPoints);
+  rOut.sNewNormals.swap(tOut.sNewNormals);
+  rOut.sTriangles.swap(tOut.sTriangles);
+  rOut.sTriangleUVs.swap(tOut.sTriangleUVs);
+  rOut.eStatus = SM_SUCCESS;
+  return SM_SUCCESS;
+}
+
 SmStatus SmTriangulateFastFace(const SmFastFaceInput & crIn, SmFastFaceOutput & rOut)
 {
   if (SmTriangulateRectangularFace(crIn, rOut) == SM_SUCCESS)
     { return SM_SUCCESS; }
-  if (gs_pfnTrimmedTriangulator != NULL)
-    {
-      rOut = SmFastFaceOutput();
-      if (gs_pfnTrimmedTriangulator(crIn, rOut) == SM_SUCCESS && rOut.eStatus == SM_SUCCESS)
-        { return SM_SUCCESS; }
-    }
   rOut = SmFastFaceOutput();
+  if (SmTriangulateTrimmedFastFace(crIn, rOut) == SM_SUCCESS && rOut.eStatus == SM_SUCCESS)
+    { return SM_SUCCESS; }
+  const SmFastFaceFailure eFailure = (rOut.eFailure != SM_FF_NONE) ? rOut.eFailure : SM_FF_OTHER;
+  rOut = SmFastFaceOutput();
+  rOut.eFailure = eFailure;
   return SM_ERR;
-}
-
-void SmSetTrimmedFaceTriangulator(SmFastFaceTriangulator pfnTriangulator)
-{
-  gs_pfnTrimmedTriangulator = pfnTriangulator;
 }
 
 namespace {
@@ -1147,6 +1261,28 @@ SmStatus sm_FaceNormals(SmFastFaceWork & rWork, SmBoolean bCorners)
   return SM_SUCCESS;
 }
 
+// an edge between two vertex ids, either way round
+inline uint64_t sm_EdgeKey(long a, long b)
+{
+  return (a < b) ? (((uint64_t)a << 32) | (uint64_t)b) : (((uint64_t)b << 32) | (uint64_t)a);
+}
+
+// the loop segments of a face, sorted
+void sm_LoopSegments(const SmFastFaceWork & crWork, std::vector<uint64_t> & rSegments)
+{
+  rSegments.clear();
+  for (const auto & crLoop : crWork.sLoops)
+    {
+      for (size_t kk = 0; kk < crLoop.size(); kk++)
+        {
+          const long a = crLoop[kk].second, b = crLoop[(kk + 1) % crLoop.size()].second;
+          if (a != b)
+            { rSegments.push_back(sm_EdgeKey(a, b)); }
+        }
+    }
+  std::sort(rSegments.begin(), rSegments.end());
+}
+
 } // end anonymous namespace
 
 /*******************************************************************//**
@@ -1268,7 +1404,10 @@ SmStatus SmTessellateFast
             }
         }
 
-      // fast triangulation, faces in parallel (surfaces other than BSpline ones serially)
+      // fast triangulation, faces in parallel (surfaces other than BSpline ones serially). The trimmed-
+      // face triangulator doesn't follow SMLib with a maximum edge length or aspect ratio (triangle
+      // counts -65% to +94% on the benchmark models), so it only runs without them.
+      const SmBoolean bTrimmedFaces = (crOptions.bTrimmedFaces && dMaxEdgeLength <= 0.0 && dMaxAspectRatio <= 0.0) ? TRUE : FALSE;
       auto FastFace = [&](ULONG ii)
         {
           SmFastFaceWork & rWork = sWork[ii];
@@ -1299,7 +1438,9 @@ SmStatus SmTessellateFast
                   rLoop[kk].lId    = crV.second;
                 }
             }
-          if (SmTriangulateFastFace(sIn, rWork.sOut) == SM_SUCCESS && rWork.sOut.eStatus == SM_SUCCESS)
+          const SmStatus eFast = bTrimmedFaces ? SmTriangulateFastFace(sIn, rWork.sOut)
+                                               : SmTriangulateRectangularFace(sIn, rWork.sOut);
+          if (eFast == SM_SUCCESS && rWork.sOut.eStatus == SM_SUCCESS)
             {
               rWork.bFast = TRUE;
               rWork.bDone = TRUE;
@@ -1315,6 +1456,48 @@ SmStatus SmTessellateFast
         });
       for (ULONG ii : sSerialFaces)
         { FastFace(ii); }
+
+      // neighbor fallback, first part: the fast faces that share a loop segment with a face rejected for
+      // its loops go to SMLib too, so that SMLib's triangles of the broken face (which may cut across a
+      // neighbor) meet SMLib's triangles of its neighbors, as in SMLib's output
+      if (crOptions.bNeighborFallback)
+        {
+          std::vector<std::pair<uint64_t, ULONG>> sSegmentFaces;
+          std::vector<uint64_t> sSegments;
+          for (ULONG ii = 0; ii < lFaces; ii++)
+            {
+              sm_LoopSegments(sWork[ii], sSegments);
+              for (uint64_t lKey : sSegments)
+                { sSegmentFaces.push_back({lKey, ii}); }
+            }
+          std::sort(sSegmentFaces.begin(), sSegmentFaces.end());
+          std::vector<char> sDemote(lFaces, 0);
+          for (ULONG ii = 0; ii < lFaces; ii++)
+            {
+              const SmFastFaceWork & crWork = sWork[ii];
+              if (crWork.pSC == NULL || crWork.bFast || crWork.sOut.eFailure != SM_FF_LOOPS)
+                { continue; }
+              sm_LoopSegments(crWork, sSegments);
+              for (uint64_t lKey : sSegments)
+                {
+                  for (auto it = std::lower_bound(sSegmentFaces.begin(), sSegmentFaces.end(), std::make_pair(lKey, (ULONG)0));
+                       it != sSegmentFaces.end() && it->first == lKey; ++it)
+                    {
+                      if (it->second != ii && sWork[it->second].bFast)
+                        { sDemote[it->second] = 1; }
+                    }
+                }
+            }
+          for (ULONG ii = 0; ii < lFaces; ii++)
+            {
+              if (!sDemote[ii])
+                { continue; }
+              sWork[ii].bFast = FALSE;
+              sWork[ii].bDone = FALSE;
+              sWork[ii].sOut  = SmFastFaceOutput();
+              rMesh.lDemotedFaces++;
+            }
+        }
       const sm_Clock::time_point sFacesEnd = sm_Clock::now();
       rMesh.dFacesMs = sm_Ms(sPhase1End, sFacesEnd);
 
@@ -1338,6 +1521,78 @@ SmStatus SmTessellateFast
         });
       for (ULONG ii : sSerialFaces)
         { if (sWork[ii].bDone) sm_FaceNormals(sWork[ii], crOptions.bCornerNormals); }
+
+      // neighbor fallback, second part: a fast face with a chord (an edge between two loop vertices that
+      // isn't one of its loop segments) that more than two triangles of the mesh use goes to SMLib, where
+      // SMLib's triangles of a face next to it cut the same chord; repeated while that demotes faces
+      for (int iPass = 0; crOptions.bNeighborFallback && iPass < 4; iPass++)
+        {
+          auto Degenerate = [](const long * aR) { return aR[0] == aR[1] || aR[1] == aR[2] || aR[2] == aR[0]; };
+          std::vector<uint64_t> sEdges;  // new vertices are the face's own: their edges can't be shared
+          for (ULONG ii = 0; ii < lFaces; ii++)
+            {
+              if (!sWork[ii].bDone)
+                { continue; }
+              const std::vector<long> & crT = sWork[ii].sOut.sTriangles;
+              for (size_t kk = 0; kk + 2 < crT.size(); kk += 3)
+                {
+                  if (Degenerate(&crT[kk]))
+                    { continue; }
+                  for (int e = 0; e < 3; e++)
+                    {
+                      const long a = crT[kk + e], b = crT[kk + (e + 1) % 3];
+                      if (a >= 0 && b >= 0)
+                        { sEdges.push_back(sm_EdgeKey(a, b)); }
+                    }
+                }
+            }
+          std::sort(sEdges.begin(), sEdges.end());
+          std::vector<ULONG>    sDemoted;
+          std::vector<uint64_t> sSegments;
+          for (ULONG ii = 0; ii < lFaces; ii++)
+            {
+              if (!sWork[ii].bFast)
+                { continue; }
+              sm_LoopSegments(sWork[ii], sSegments);
+              const std::vector<long> & crT = sWork[ii].sOut.sTriangles;
+              bool bConflict = false;
+              for (size_t kk = 0; kk + 2 < crT.size() && !bConflict; kk += 3)
+                {
+                  if (Degenerate(&crT[kk]))
+                    { continue; }
+                  for (int e = 0; e < 3 && !bConflict; e++)
+                    {
+                      const long a = crT[kk + e], b = crT[kk + (e + 1) % 3];
+                      if (a < 0 || b < 0)
+                        { continue; }
+                      const uint64_t lKey = sm_EdgeKey(a, b);
+                      if (std::binary_search(sSegments.begin(), sSegments.end(), lKey))
+                        { continue; }
+                      const auto sRange = std::equal_range(sEdges.begin(), sEdges.end(), lKey);
+                      bConflict = (sRange.second - sRange.first) > 2;
+                    }
+                }
+              if (bConflict)
+                { sDemoted.push_back(ii); }
+            }
+          if (sDemoted.empty())
+            { break; }
+          for (ULONG ii : sDemoted)
+            {
+              SmFastFaceWork & rWork = sWork[ii];
+              rWork.bFast = FALSE;
+              rWork.bDone = FALSE;
+              rWork.sOut  = SmFastFaceOutput();
+              rMesh.lDemotedFaces++;
+              if (   sTess.Phase2CreateFacePolygons(rWork.pFace) == SM_SUCCESS
+                  && sm_CopyPhase2Triangles(rWork, sVertexIds, sLoopPoints) == SM_SUCCESS)
+                {
+                  rWork.bDone = TRUE;
+                  sm_FaceNormals(rWork, crOptions.bCornerNormals);
+                }
+              rWork.pSC = sTess.GetTessSrfCacheOfFace(rWork.pFace);
+            }
+        }
       const sm_Clock::time_point sFallbackEnd = sm_Clock::now();
       rMesh.dFallbackMs = sm_Ms(sFacesEnd, sFallbackEnd);
 

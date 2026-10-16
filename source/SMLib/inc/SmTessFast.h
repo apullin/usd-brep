@@ -71,9 +71,19 @@ struct SmFastFaceInput
   SmBoolean              bParallelSafe = FALSE;  // TRUE: cpSurface may be evaluated on several threads at once
 };
 
+// Why a triangulator rejected a face.
+enum SmFastFaceFailure
+{
+  SM_FF_NONE = 0,  // not rejected
+  SM_FF_LOOPS,     // its boundary loops are unusable (crossing, clockwise, duplicate points, bad input): the
+                   // pipeline sends the faces that share a loop segment with it to SMLib too
+  SM_FF_OTHER      // any other reason
+};
+
 struct SmFastFaceOutput
 {
-  SmStatus eStatus = SM_ERR;              // anything but SM_SUCCESS: the face falls back to SMLib
+  SmStatus          eStatus  = SM_ERR;      // anything but SM_SUCCESS: the face falls back to SMLib
+  SmFastFaceFailure eFailure = SM_FF_NONE;  // why, when eStatus != SM_SUCCESS
   std::vector<SmPoint2d>  sNewUV;         // interior vertices added by the triangulator ...
   std::vector<SmPoint3d>  sNewPoints;     // ... their 3D points (surface evaluations) ...
   std::vector<SmVector3d> sNewNormals;    // ... and unit surface normals (Su x Sv, not reversed)
@@ -87,19 +97,18 @@ struct SmFastFaceOutput
   std::vector<SmPoint2d> sTriangleUVs;
 };
 
-// Must be deterministic and must not touch shared SMLib state (no marks, no Notify, no context
-// allocation of topology), so that faces can run on worker threads with sm_ParallelFor().
-// The dispatcher: the rectangular-face triangulator, then any registered triangulator for trimmed faces.
+// Triangulators must be deterministic and must not touch shared SMLib state (no marks, no Notify, no
+// context allocation of topology), so that faces can run on worker threads with sm_ParallelFor().
+// The dispatcher: the rectangular-face triangulator, then the trimmed-face one.
 SM_EXPORT SmStatus SmTriangulateFastFace(const SmFastFaceInput & crIn, SmFastFaceOutput & rOut);
 
 // Triangulator for faces whose outer loop is the rectangle of their refinement tree's UV domain
 // (natural or rectangular trim, e.g. terrain): one or two triangles per tree leaf.
 SM_EXPORT SmStatus SmTriangulateRectangularFace(const SmFastFaceInput & crIn, SmFastFaceOutput & rOut);
 
-// Optional triangulator for other faces (track G3), tried after the rectangular one. NULL = none,
-// such faces fall back to SMLib. Not thread-safe to change while SmTessellateFast() runs.
-typedef SmStatus (*SmFastFaceTriangulator)(const SmFastFaceInput & crIn, SmFastFaceOutput & rOut);
-SM_EXPORT void SmSetTrimmedFaceTriangulator(SmFastFaceTriangulator pfnTriangulator);
+// Triangulator for any face: SmTriangulateTrimmedFace() (SmFastFace.h), a constrained Delaunay
+// triangulation of the loops with the refinement tree's leaf corners and refinement points.
+SM_EXPORT SmStatus SmTriangulateTrimmedFastFace(const SmFastFaceInput & crIn, SmFastFaceOutput & rOut);
 
 /*******************************************************************//**
    Output of SmTessellateFast(): one triangle mesh for the whole Brep.
@@ -118,6 +127,7 @@ struct SmFastMesh
   ULONG  lFastFaces     = 0;   // faces triangulated by a fast triangulator
   ULONG  lFallbackFaces = 0;   // faces triangulated by SMLib's Phase 2
   ULONG  lFailedFaces   = 0;   // faces without triangles (Phase 1 or Phase 2 failed)
+  ULONG  lDemotedFaces  = 0;   // faces a fast triangulator did that went to SMLib (neighbor fallback)
   ULONG  lDroppedTriangles = 0;  // degenerate triangles dropped (repeated vertex)
   double dPhase1Ms      = 0.0; // copy + Phase 1
   double dFacesMs       = 0.0; // input building + fast triangulation
@@ -130,6 +140,10 @@ struct SmFastOptions
 {
   SmBoolean bCornerNormals  = FALSE;  // fill SmFastMesh::sCornerNormals
   SmBoolean bFastFaces      = TRUE;   // FALSE: every face falls back to SMLib (tests the pipeline)
+  SmBoolean bTrimmedFaces   = TRUE;   // FALSE: only the rectangular-face triangulator (it also is the only
+                                      // one with a maximum edge length or aspect ratio)
+  SmBoolean bNeighborFallback = TRUE; // faces next to faces with unusable loops, and fast faces whose
+                                      // chords other faces' triangles use too, go to SMLib as well
   SmBoolean bAllowPartial   = FALSE;  // TRUE: faces that fail are skipped instead of failing the call
   SmBoolean bFastRefinement = TRUE;   // FALSE: SMLib's own refinement tree build (the same tree, slower)
 };
