@@ -333,6 +333,8 @@ public:
   SmNotifyCallback * GetUserNotifyCallback()   const { return  m_pUserNotifyCallback ; }
   SmNotifyCallback * GetUserCallback()         const { return  GetUserNotifyCallback() ; }
   SmNotifyCallback * GetSysNotifyCallback()          { return  m_pSysNotifyCallBack ; }
+  // TRUE when SmObject::Notify() calls reach a user or system notification callback
+  SmBoolean          HasNotifyCallbacks()      const { return (m_pUserNotifyCallback != NULL || m_pSysNotifyCallBack != NULL) ? TRUE : FALSE ; }
 #ifdef SM_USE_GLOBAL_CACHE
   SmGlobalCache  * GetGlobalCache()            const { return m_pGlobalCache; }
   void             GetGlobalCacheSize (SmGlobalCacheSize &rGlobalCacheSize) const ;

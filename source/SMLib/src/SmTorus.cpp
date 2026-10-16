@@ -243,7 +243,8 @@ SmStatus SmTorus::CreateCanonicalOnSTEPUVDomain
   SmBoolean              & rbAdjusted)
 {
   rbAdjusted = FALSE;
-  if (!(dMinorRadius > SM_EFF_ZERO) || !(dMajorRadius > SM_EFF_ZERO))
+  // notification callbacks see every object and edit: give them CreateCanonical()'s
+  if (!(dMinorRadius > SM_EFF_ZERO) || !(dMajorRadius > SM_EFF_ZERO) || crContext.HasNotifyCallbacks())
     { return CreateCanonical(crContext, crOrigin, dMajorRadius, dMinorRadius, rpNewTorus); }
 
   // as CreateCanonical()

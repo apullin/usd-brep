@@ -456,7 +456,8 @@ SmStatus SmCone::CreateCanonicalOnSTEPUVDomain
    SmBoolean              & rbAdjusted)
 {
   rbAdjusted = FALSE;
-  if(dHeight <= 0)
+  // notification callbacks see every object and edit: give them CreateCanonical()'s
+  if(dHeight <= 0 || crContext.HasNotifyCallbacks())
     { return CreateCanonical(crContext, crOrigin, dBotRadius, dTopRadius, dHeight, rpNewCone); }
 
   // as CreateCanonical()

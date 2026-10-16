@@ -395,6 +395,8 @@ NOTES: Returns TRUE when done: bit for bit the surface of those two calls.
        2. the first MakeNurb() can't fail: CreateSurfOfRevolution() finds a
           GenCurve control point off the rotation axis, and
        3. the last RebuildPolarConverter() sets up the whole PolarConverter.
+       Not done when the context has notification callbacks: they would see
+       different objects and edits.
 ***********************************************************************/
 SmBoolean SmSurfOfRevolution::MakeNurbOnSTEPUVDomain
   (const SmExtent2d & crNewSTEPUVDomain,  // in : new desired domain, as AdjustSTEPUVDomain()
@@ -403,7 +405,9 @@ SmBoolean SmSurfOfRevolution::MakeNurbOnSTEPUVDomain
   rbTouched = FALSE ;
   if (   m_pNurb != NULL
       || m_pGenCurve == NULL
-      || m_pGenCurve->GetGwNurbPointer() == NULL)
+      || m_pGenCurve->GetGwNurbPointer() == NULL
+      || GetContext() == NULL
+      || GetContext()->HasNotifyCallbacks())   // callbacks would see different objects and edits
     { return FALSE ; }
 
   // AdjustSTEPUVDomain() no work case: nothing to save

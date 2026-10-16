@@ -911,6 +911,20 @@ SmStatus run_sm_api(SmBoolean bDoGraphics)
       smos_WriteBuffer(_T("\n\n******************** End TestSmCanonicalOnSTEPUVDomain NOT successful ************\n"));
   }
 
+  MYPRINTF(_T("\n\n******************** Start TestSmNotifySequenceWithCallbacks ************\n"));
+
+  stat = TestSmNotifySequenceWithCallbacks();
+  iCnt++;
+
+  if (stat == SM_SUCCESS) {
+      nSuccessFul++;
+      smos_WriteBuffer(_T("\n\n******************** End TestSmNotifySequenceWithCallbacks Successful ************\n"));
+  }
+  else {
+      nFailed++;
+      smos_WriteBuffer(_T("\n\n******************** End TestSmNotifySequenceWithCallbacks NOT successful ************\n"));
+  }
+
   MYPRINTF(_T("\n\n******************** Start TestSmBrepCopyRepresentation ************\n"));
   stat = TestSmBrepCopyRepresentation();
   iCnt++;

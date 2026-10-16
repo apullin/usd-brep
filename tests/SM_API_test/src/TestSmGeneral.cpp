@@ -36,11 +36,16 @@
 #include <SmPoly.h>
 #include <SmSurface.h>
 #include <SmTrimmingTools.h>
+#include <SmContext.h>
+#include <SmBrepData.h>
 #include <nurbs.h>
 
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <vector>
+#include <string>
+#include <map>
 
 static SmBoolean sm_TestPointClose(const SmPoint3d& crActual, const SmPoint3d& crExpected)
 {
@@ -1125,6 +1130,159 @@ SmStatus TestSmCanonicalOnSTEPUVDomain()
     }
     // the one-step path ran (not only the fallback)
     return iAdjusted >= 16 ? SM_SUCCESS : SM_ERR;
+}
+
+//*************************************************************************
+// Notification callbacks must see the same thing with and without the
+// shortcuts: CreateCanonicalOnSTEPUVDomain must emit the events of
+// CreateCanonical() then AdjustSTEPUVDomain(), and MakeTopologyFromData's
+// geometry take-over those of copying, on the same kinds of objects. Without
+// callbacks, the shortcuts must still be taken.
+//*************************************************************************
+
+// Both callbacks of a context, recording "<U|S> <event> <caller> <data1> <data2> <data3>" with objects
+// numbered by first appearance (retired at SM_NO_DESTRUCTION).
+class SmTestNotifyLog
+{
+    class Recorder : public SmNotifyCallback
+    {
+    public:
+        Recorder(SmTestNotifyLog& rLog, char cTag) : m_rLog(rLog), m_cTag(cTag) {}
+        SmStatus Execute(SmNotifyOperation eAction, SmObject* pObj, SmObject* pData1, SmObject* pData2,
+                         SmObject* pData3) override
+        {
+            m_rLog.m_sEvents.push_back(std::string(1, m_cTag) + " " + std::to_string((int)eAction) + " " + m_rLog.Id(pObj)
+                                       + " " + m_rLog.Id(pData1) + " " + m_rLog.Id(pData2) + " " + m_rLog.Id(pData3));
+            if (m_cTag == 'S' && eAction == SM_NO_DESTRUCTION)  // the system callback runs last
+                m_rLog.m_sIds.erase(pObj);
+            return SM_SUCCESS;
+        }
+    private:
+        SmTestNotifyLog& m_rLog;
+        char             m_cTag;
+    };
+
+public:
+    SmTestNotifyLog() : m_sUser(*this, 'U'), m_sSys(*this, 'S') {}
+    void Attach(SmContext& rContext) { rContext.SetUserNotifyCallback(&m_sUser); rContext.SetSysNotifyCallback(&m_sSys); }
+    static void Detach(SmContext& rContext) { rContext.SetUserNotifyCallback(NULL); rContext.SetSysNotifyCallback(NULL); }
+    std::string Id(const SmObject* pObj)
+    {
+        if (pObj == NULL)
+            return "-";
+        auto it = m_sIds.find(pObj);
+        long lId = (it != m_sIds.end()) ? it->second : (m_sIds[pObj] = m_lNext++);
+        return std::string(pObj->GetTypeString()) + "#" + std::to_string(lId);
+    }
+    std::vector<std::string>          m_sEvents;
+    std::map<const void*, long>       m_sIds;
+    long                              m_lNext = 0;
+    Recorder                          m_sUser, m_sSys;
+};
+
+// One cylinder (0), torus (1), sphere (2) or bounded cone (3) on a partial domain in a new context
+static SmStatus sm_RecordSurfaceOfRevolution(int iType, SmBoolean bOneStep, SmBoolean bCallbacks,
+                                             std::vector<std::string>& rEvents, SmBoolean& rbAdjusted)
+{
+    SmContext       sContext;
+    SmTestNotifyLog sLog;
+    if (bCallbacks)
+        sLog.Attach(sContext);
+    const SmAxis2Placement sPlacement(SmPoint3d(1.5, -2.0, 3.0), SmVector3d(0, 0, 1), SmVector3d(1, 0, 0));
+    const SmExtent2d sDomain = (iType == 0) ? SmExtent2d(30.0, -1.0, 250.0, 4.0)
+                             : (iType == 3) ? SmExtent2d(30.0, 0.0, 250.0, 3.0)
+                                            : SmExtent2d(30.0, -40.0, 250.0, 60.0);
+    SmSurfOfRevolution* pSurface = NULL;
+    SmStatus stat = SM_SUCCESS;
+    rbAdjusted = FALSE;
+    if (iType == 0)
+    {
+        SmCylinder* p = NULL;
+        stat = bOneStep ? SmCylinder::CreateCanonicalOnSTEPUVDomain(sContext, sPlacement, 2.75, sDomain, p, rbAdjusted)
+                        : SmCylinder::CreateCanonical(sContext, sPlacement, 2.75, p);
+        pSurface = p;
+    }
+    else if (iType == 1)
+    {
+        SmTorus* p = NULL;
+        stat = bOneStep ? SmTorus::CreateCanonicalOnSTEPUVDomain(sContext, sPlacement, 6.0, 1.5, sDomain, p, rbAdjusted)
+                        : SmTorus::CreateCanonical(sContext, sPlacement, 6.0, 1.5, p);
+        pSurface = p;
+    }
+    else if (iType == 2)
+    {
+        SmSphere* p = NULL;
+        stat = bOneStep ? SmSphere::CreateCanonicalOnSTEPUVDomain(sContext, sPlacement, 4.0, sDomain, p, rbAdjusted)
+                        : SmSphere::CreateCanonical(sContext, sPlacement, 4.0, p);
+        pSurface = p;
+    }
+    else
+    {
+        SmCone* p = NULL;
+        stat = bOneStep ? SmCone::CreateCanonicalOnSTEPUVDomain(sContext, sPlacement, 2.0, 1.25, 3.0, sDomain, p, rbAdjusted)
+                        : SmCone::CreateCanonical(sContext, sPlacement, 2.0, 1.25, 3.0, p);
+        pSurface = p;
+    }
+    if (stat == SM_SUCCESS && pSurface != NULL && !rbAdjusted)
+        stat = pSurface->AdjustSTEPUVDomain(sDomain);
+    delete pSurface;
+    SmTestNotifyLog::Detach(sContext);
+    rEvents = sLog.m_sEvents;
+    return (pSurface != NULL) ? stat : SM_ERR;
+}
+
+// MakeTopologyFromData of crSource's SmBrepData in a new context; rlTaken = surfaces left to the Brep
+static SmStatus sm_RecordMakeTopology(const SmBrep& crSource, SmBoolean bTakeGeometry, SmBoolean bCallbacks,
+                                      std::vector<std::string>& rEvents, ULONG& rlTaken)
+{
+    SmContext              sContext;
+    SmTArray<SmAttribute*> sAttributes;
+    SmBrepData*            pData = new (sContext) SmBrepData(FALSE, SM_DS_SMLIB);
+    SmObjDelete            sCleanData(pData);
+    SER(pData->FromBrep(crSource, sAttributes));
+    SmTestNotifyLog sLog;
+    if (bCallbacks)
+        sLog.Attach(sContext);
+    SmBrep*  pBrep = new (sContext) SmBrep();
+    SmStatus stat  = pBrep->MakeTopologyFromData(pData, sAttributes, FALSE, FALSE, TRUE, FALSE, FALSE, FALSE, bTakeGeometry);
+    rlTaken = 0;
+    for (ULONG i = 0; i < pData->m_vSurfaces.GetSize(); i++)
+        if (pData->m_vSurfaces[i] == NULL)
+            rlTaken++;
+    delete pBrep;
+    sCleanData.DeleteObj();
+    SmTestNotifyLog::Detach(sContext);
+    rEvents = sLog.m_sEvents;
+    return stat;
+}
+
+SmStatus TestSmNotifySequenceWithCallbacks()
+{
+    SmApiCreateContext();
+    for (int iType = 0; iType < 4; iType++)
+    {
+        std::vector<std::string> sOld, sNew;
+        SmBoolean bAdjusted = FALSE;
+        SER(sm_RecordSurfaceOfRevolution(iType, FALSE, TRUE, sOld, bAdjusted));
+        SER(sm_RecordSurfaceOfRevolution(iType, TRUE, TRUE, sNew, bAdjusted));
+        if (bAdjusted || sOld.empty() || sOld != sNew)
+            return SM_ERR;
+        SER(sm_RecordSurfaceOfRevolution(iType, TRUE, FALSE, sNew, bAdjusted));
+        if (!bAdjusted)
+            return SM_ERR;
+    }
+
+    SmBrep* pBox = NULL;
+    SER(SmApiCreateBox(SmVector3d(0.5, -1.0, 2.0), 3.0, 2.0, 1.0, pBox));
+    SmObjDelete sCleanBox(pBox);
+    std::vector<std::string> sOld, sNew;
+    ULONG lTaken = 0;
+    SER(sm_RecordMakeTopology(*pBox, FALSE, TRUE, sOld, lTaken));
+    SER(sm_RecordMakeTopology(*pBox, TRUE, TRUE, sNew, lTaken));
+    if (lTaken != 0 || sOld.empty() || sOld != sNew)
+        return SM_ERR;
+    SER(sm_RecordMakeTopology(*pBox, TRUE, FALSE, sNew, lTaken));
+    return (lTaken == 6) ? SM_SUCCESS : SM_ERR;
 }
 
 //*************************************************************************

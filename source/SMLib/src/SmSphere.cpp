@@ -241,7 +241,8 @@ SmStatus SmSphere::CreateCanonicalOnSTEPUVDomain
   // as CreateCanonical()
   const SmBoolean bInsideOut = (dRadius < 0.0) ? TRUE : FALSE;
   const double    dAbsRadius = fabs(dRadius);
-  if (!(dAbsRadius > SM_EFF_ZERO))
+  // notification callbacks see every object and edit: give them CreateCanonical()'s
+  if (!(dAbsRadius > SM_EFF_ZERO) || crContext.HasNotifyCallbacks())
     { return CreateCanonical(crContext, crOrigin, dRadius, rpNewSphere); }
   SmExtent2d sAnalUVDomain(SmPoint2d(  0.0,-90.0),
                            SmPoint2d(360.0, 90.0));

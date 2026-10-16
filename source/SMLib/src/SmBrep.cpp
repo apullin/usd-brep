@@ -19368,7 +19368,9 @@ PURPOSE: MakeTopologyFromData() above, using pBrepData's surfaces and curves
     instead of copies of them when bTakeGeometry is TRUE and a copy would be
     a clone: those leave pBrepData, which is only good for deleting then.
 
-NOTES: See sm_MakeGeometryAsItsCopy(). Only geometry used once is taken.
+NOTES: See sm_MakeGeometryAsItsCopy(). Only geometry used once is taken, and
+       none when the context has notification callbacks (they would not see
+       the copies being made).
 ***********************************************************************/
 SmStatus SmBrep::MakeTopologyFromData
 (
@@ -19452,8 +19454,9 @@ static ULONG lFileCount = 0;
     } // end m_bIsGeomBorrowed == TRUE check
 
   // when taking geometry: the number of users of each surface and curve
+  // (not with notification callbacks: they see the copies being made)
   SmTArray<ULONG> sSurfaceUsers, s3DCurveUsers, sUVCurveUsers;
-  if (bTakeGeometry && !bAddAnalytics)
+  if (bTakeGeometry && !bAddAnalytics && !pContext->HasNotifyCallbacks())
     {
       sSurfaceUsers.InsertAt(0, 0, pBrepData->m_vSurfaces.GetSize());
       s3DCurveUsers.InsertAt(0, 0, pBrepData->m_v3DCurves.GetSize());

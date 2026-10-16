@@ -205,7 +205,8 @@ SmStatus SmCylinder::CreateCanonicalOnSTEPUVDomain
    SmBoolean              & rbAdjusted)
 {
   rbAdjusted = FALSE;
-  if (!(dRadius > SM_EFF_ZERO))
+  // notification callbacks see every object and edit: give them CreateCanonical()'s
+  if (!(dRadius > SM_EFF_ZERO) || crContext.HasNotifyCallbacks())
     { return CreateCanonical(crContext, crOrigin, dRadius, rpNewCylinder); }
 
   // as CreateCanonical()
