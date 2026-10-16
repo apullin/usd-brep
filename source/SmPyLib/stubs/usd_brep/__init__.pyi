@@ -44,6 +44,14 @@ class TessellationError(RuntimeError):
     status: int
     status_name: str
 
+class FastTessellationReport(TypedDict):
+    face_ids: list[int]
+    face_kinds: list[Literal["fast", "fallback", "failed"]]
+    failed_faces: list[int]
+    fast_face_count: int
+    fallback_face_count: int
+    failed_face_count: int
+
 # Loop / Loopuse / Edgeuse topology, topology_pick_ray, and kernel Draw extraction
 # live in the separate _smlib_dev module. See
 # source/SmPyDevLib/stubs/smlib_dev/__init__.pyi.
@@ -417,6 +425,33 @@ def tessellate(
     return_failures: bool = False,
     return_report: bool = False,
 ) -> PolyBrep | tuple[PolyBrep, list[TessellationFailure]] | tuple[PolyBrep, TessellationReport]: ...
+
+@overload
+def tessellate_fast(
+    brep: Brep,
+    *,
+    chord_height_tolerance: float = 0.0,
+    curve_angle_tolerance_deg: float = 25.0,
+    surface_angle_tolerance_deg: float = 25.0,
+    max_edge_length: float = 0.0,
+    max_aspect_ratio: float = 0.0,
+    allow_partial: Literal[False] = False,
+    face_varying_normals: bool = False,
+    return_report: Literal[False] = False,
+) -> dict[str, list[object]]: ...
+@overload
+def tessellate_fast(
+    brep: Brep,
+    *,
+    chord_height_tolerance: float = 0.0,
+    curve_angle_tolerance_deg: float = 25.0,
+    surface_angle_tolerance_deg: float = 25.0,
+    max_edge_length: float = 0.0,
+    max_aspect_ratio: float = 0.0,
+    allow_partial: bool = False,
+    face_varying_normals: bool = False,
+    return_report: Literal[True],
+) -> tuple[dict[str, list[object]], FastTessellationReport]: ...
 
 def read_brep_from_file(
     filename: str,

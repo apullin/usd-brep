@@ -10,7 +10,9 @@ tessellated with the default parameters in one warmup round and --repetitions
 measured rounds, in a seeded random order. Timings cover tessellate() only.
 Every round hashes the meshes, with points and face normals at double
 precision; --save records hashes and timings, and --compare reports speedups
-and fails if any mesh changed.
+and fails if any mesh changed. --fast times the opt-in fast tessellator,
+tessellate_fast(), instead, including building its Python mesh arrays, and
+hashes those float32 arrays.
 """
 
 import argparse
@@ -89,13 +91,17 @@ def describe_machine():
             "python": platform.python_version()}
 
 
-def tessellate(sm, breps, parameters):
-    """Tessellate every Brep of a model; returns elapsed ns and meshes (exceptions for failures)."""
+def tessellate(sm, breps, parameters, fast=False):
+    """Tessellate every Brep of a model; returns elapsed ns and meshes (exceptions for failures).
+
+    With fast, the meshes are tessellate_fast()'s arrays, which the timing includes building.
+    """
+    function = sm.tessellate_fast if fast else sm.tessellate
     meshes = []
     started = time.perf_counter_ns()
     for brep in breps:
         try:
-            meshes.append(sm.tessellate(brep, **parameters))
+            meshes.append(function(brep, **parameters))
         except RuntimeError as error:
             meshes.append(error)
     return time.perf_counter_ns() - started, meshes
@@ -115,6 +121,12 @@ def mesh_signature(meshes):
             digest.update(b"tessellation failed")
             summary.append(str(mesh))
             continue
+        if isinstance(mesh, dict):  # tessellate_fast() arrays, already float32
+            for key in ("points", "normals", "face_normals"):
+                digest.update(array("d", itertools.chain.from_iterable(mesh[key])).tobytes())
+            digest.update(array("q", mesh["faces"]).tobytes())
+            summary.append(len(mesh["face_normals"]))
+            continue
         digest.update(array("d", itertools.chain.from_iterable(mesh.get_points())).tobytes())
         digest.update(array("d", itertools.chain.from_iterable(face.get_normal() for face in mesh.get_faces())).tobytes())
         arrays = mesh.to_mesh_arrays()
@@ -131,10 +143,14 @@ def main():
     parser.add_argument("--seed", type=int, default=20261013, help="seed for the per-round model order")
     parser.add_argument("--save", type=Path, help="write hashes and timings to this JSON file")
     parser.add_argument("--compare", type=Path, help="baseline JSON from --save; fail if any mesh differs")
+    parser.add_argument("--fast", action="store_true", help="time the opt-in fast tessellator, tessellate_fast()")
     args = parser.parse_args()
     if args.repetitions < 1:
         parser.error("--repetitions must be at least 1")
     baseline = json.loads(args.compare.read_text()) if args.compare else None
+    tessellator = "fast" if args.fast else "smlib"
+    if baseline and baseline.get("tessellator", "smlib") != tessellator:
+        parser.error(f"--compare baseline was made with the {baseline.get('tessellator', 'smlib')} tessellator")
 
     try:
         import _omni_solid as sm
@@ -172,7 +188,7 @@ def main():
             rng.shuffle(order)
             for name in order:
                 record = models[name]
-                elapsed, meshes = tessellate(sm, record["breps"], parameters)
+                elapsed, meshes = tessellate(sm, record["breps"], parameters, args.fast)
                 signature, summary = mesh_signature(meshes)
                 if record.setdefault("mesh_sha256", signature) != signature:
                     record["unstable"] = True
@@ -183,8 +199,8 @@ def main():
     for record in models.values():
         record.pop("breps", None)
     report = {"created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-              "repetitions": args.repetitions, "seed": args.seed, "tessellation": parameters,
-              "kernel": loaded_kernel(), "machine": describe_machine(), "models": models}
+              "repetitions": args.repetitions, "seed": args.seed, "tessellator": tessellator,
+              "tessellation": parameters, "kernel": loaded_kernel(), "machine": describe_machine(), "models": models}
 
     failed = False
     print(f"{'model':<30}{'triangles':>10}{'min ms':>10}{'mean ms':>10}{'std':>8}"

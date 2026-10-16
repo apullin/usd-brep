@@ -584,6 +584,11 @@ void bind_usd(py::module_& parent)
        "        was authored, or the output cannot be written. When no mesh was\n"
        "        authored, the message names each failed Brep and why.\n"
        "\n"
+       "Notes:\n"
+       "    The meshes come from ``tessellate``'s tessellator, or from the fast one\n"
+       "    of ``tessellate_fast`` when the environment variable\n"
+       "    ``SMLIB_FAST_TESSELLATION`` is ``1`` (read once per process).\n"
+       "\n"
        "Wraps: SmApiUsdTessellateFile");
 
     m.def("heal_file",

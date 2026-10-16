@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Bridges: SmApiBrep.h (SmApiTessellate — exact Brep NURBS to PolyBrep mesh;
+//                       SmApiTessellateFast — opt-in fast tessellation to mesh arrays;
 //                       SmApiTessellateBoundaries — trimmed edge curves to polylines).
 
 #include "SmPyCommon.h"
 
 #include <SmApiBrep.h>
 #include <SmEdge.h>
+
+#include <cmath>
 
 static py::dict tessellation_report_to_dict(const SmTessellationReport& report)
 {
@@ -64,6 +67,158 @@ py::object smpy_tessellate(SmBrep* brep, double chord_height_tol, double curve_a
     if (return_failures)
         return py::make_tuple(mesh, tessellation_failures_to_list(report.failures));
     return mesh;
+}
+
+// A list of (x, y, z) tuples of Python floats, from 3 values per tuple.
+static py::list float3_list(const std::vector<float>& values)
+{
+    const size_t count = values.size() / 3;
+    py::list result(count);
+    for (size_t i = 0; i < count; ++i)
+    {
+        PyObject* tuple = PyTuple_New(3);
+        if (!tuple) throw py::error_already_set();
+        PyList_SET_ITEM(result.ptr(), static_cast<py::ssize_t>(i), tuple);
+        for (size_t k = 0; k < 3; ++k)
+        {
+            PyObject* value = PyFloat_FromDouble(values[3 * i + k]);
+            if (!value) throw py::error_already_set();
+            PyTuple_SET_ITEM(tuple, static_cast<py::ssize_t>(k), value);
+        }
+    }
+    return result;
+}
+
+static py::list int_list(const std::vector<long>& values)
+{
+    py::list result(values.size());
+    for (size_t i = 0; i < values.size(); ++i)
+    {
+        PyObject* value = PyLong_FromLong(values[i]);
+        if (!value) throw py::error_already_set();
+        PyList_SET_ITEM(result.ptr(), static_cast<py::ssize_t>(i), value);
+    }
+    return result;
+}
+
+static SmVector3d unit_or(const SmVector3d& vector, const SmVector3d& fallback)
+{
+    const double length = std::sqrt(vector.x * vector.x + vector.y * vector.y + vector.z * vector.z);
+    return std::isfinite(length) && length > 1e-30 ? vector / length : fallback;
+}
+
+// SmApiTessellateFast's mesh as PolyBrep.to_mesh_arrays() returns a mesh: float32 values, polygon
+// stream, vertex or corner normals, and face normals as SmPolyFace::GetNormal() computes them.
+static py::dict fast_mesh_arrays(const SmFastTessellation& mesh, bool faceVaryingNormals)
+{
+    const ULONG nVerts = mesh.sPoints.GetSize() / 3;
+    const ULONG nTris = mesh.sTriangles.GetSize() / 3;
+    if (mesh.sNormals.GetSize() != 3 * nVerts || (faceVaryingNormals && mesh.sCornerNormals.GetSize() != 9 * nTris))
+        throw std::runtime_error("SmApiTessellateFast returned inconsistent mesh arrays");
+    std::vector<float> points(3 * static_cast<size_t>(nVerts));
+    for (ULONG i = 0; i < 3 * nVerts; ++i)
+        points[i] = static_cast<float>(mesh.sPoints[i]);
+    std::vector<float> normals;
+    std::vector<long> faces;
+    std::vector<float> faceNormals;
+    faces.reserve(4 * static_cast<size_t>(nTris));
+    faceNormals.reserve(3 * static_cast<size_t>(nTris));
+    if (faceVaryingNormals)
+        normals.reserve(9 * static_cast<size_t>(nTris));
+    else
+        normals.assign(mesh.sNormals.GetDataArray(), mesh.sNormals.GetDataArray() + mesh.sNormals.GetSize());
+    auto point = [&](int v) {
+        return SmVector3d(mesh.sPoints[3 * v], mesh.sPoints[3 * v + 1], mesh.sPoints[3 * v + 2]);
+    };
+    for (ULONG t = 0; t < nTris; ++t)
+    {
+        const int* corners = &mesh.sTriangles[3 * t];
+        faces.insert(faces.end(), { 3L, corners[0], corners[1], corners[2] });
+        if (faceVaryingNormals)
+        {
+            for (ULONG c = 0; c < 3; ++c)
+            {
+                const float* corner = &mesh.sCornerNormals[9 * t + 3 * c];
+                const float* average = &mesh.sNormals[3 * corners[c]];
+                const SmVector3d cornerNormal = unit_or(SmVector3d(corner[0], corner[1], corner[2]),
+                                                        SmVector3d(average[0], average[1], average[2]));
+                normals.insert(normals.end(), { static_cast<float>(cornerNormal.x), static_cast<float>(cornerNormal.y),
+                                                static_cast<float>(cornerNormal.z) });
+            }
+        }
+        // As SmPolyFace::GetNormal() for a triangle: (1, 1, 1) when degenerate.
+        const SmVector3d start = point(corners[0]);
+        SmVector3d normal = (point(corners[1]) - start) * (point(corners[2]) - start);
+        if (normal.LengthSquared() > SM_EFF_ZERO_SQ)
+            normal.Unitize();
+        else
+            normal.Set(1, 1, 1);
+        normal = unit_or(normal, SmVector3d(0, 0, 1));
+        faceNormals.insert(faceNormals.end(), { static_cast<float>(normal.x), static_cast<float>(normal.y), static_cast<float>(normal.z) });
+    }
+    py::dict out;
+    out["points"] = float3_list(points);
+    out["normals"] = float3_list(normals);
+    out["faces"] = int_list(faces);
+    out["face_normals"] = float3_list(faceNormals);
+    return out;
+}
+
+static py::dict fast_report_to_dict(const SmFastTessellation& mesh)
+{
+    std::vector<long> faceIds(mesh.sTriangleFaces.GetDataArray(), mesh.sTriangleFaces.GetDataArray() + mesh.sTriangleFaces.GetSize());
+    py::list kinds;
+    py::list failed;
+    for (ULONG i = 0; i < mesh.sFaceKinds.GetSize(); ++i)
+    {
+        const SmFastFaceKind kind = mesh.sFaceKinds[i];
+        kinds.append(kind == SM_FAST_FACE_FAST ? "fast" : kind == SM_FAST_FACE_FALLBACK ? "fallback" : "failed");
+        if (kind == SM_FAST_FACE_FAILED)
+            failed.append(i);
+    }
+    py::dict result;
+    result["face_ids"] = int_list(faceIds);
+    result["face_kinds"] = kinds;
+    result["failed_faces"] = failed;
+    result["fast_face_count"] = mesh.lFastFaces;
+    result["fallback_face_count"] = mesh.lFallbackFaces;
+    result["failed_face_count"] = mesh.lFailedFaces;
+    return result;
+}
+
+static py::object smpy_tessellate_fast(SmBrep* brep, double chord_height_tol, double curve_angle_tol_deg,
+                                       double surface_angle_tol_deg, double max_edge_length, double max_aspect_ratio,
+                                       bool allow_partial, bool face_varying_normals, bool return_report)
+{
+    if (allow_partial && !return_report)
+        throw py::value_error("allow_partial=True requires return_report=True");
+    SmTessellationParams params;
+    params.dChordHeightTol     = chord_height_tol;
+    params.dCurveAngleTolDeg   = curve_angle_tol_deg;
+    params.dSurfaceAngleTolDeg = surface_angle_tol_deg;
+    params.dMaxEdgeLength      = max_edge_length;
+    params.dMaxAspectRatio     = max_aspect_ratio;
+    // The mesh is a local: everything returned is a Python-owned copy.
+    SmFastTessellation mesh;
+    SmPyErrorTrail::clear();
+    const SmStatus status = SmApiTessellateFast(brep, mesh, params, allow_partial ? TRUE : FALSE, face_varying_normals ? TRUE : FALSE);
+    if (status != SM_SUCCESS && mesh.lFailedFaces > 0 && !allow_partial)
+    {
+        std::string faces;
+        for (ULONG i = 0; i < mesh.sFaceKinds.GetSize(); ++i)
+            if (mesh.sFaceKinds[i] == SM_FAST_FACE_FAILED)
+                faces += (faces.empty() ? "" : ", ") + std::to_string(i);
+        throw std::runtime_error(std::string("SmApiTessellateFast failed: ") + sm_status_name(status) + " (" +
+                                 std::to_string(status) + "). " + std::to_string(mesh.lFailedFaces) +
+                                 " face(s) failed to tessellate (indices: " + faces +
+                                 "); allow_partial=True with return_report=True keeps the others");
+    }
+    if (status != SM_SUCCESS)
+        SmPyRaise(status, "SmApiTessellateFast", __FILE__, __LINE__);
+    py::dict arrays = fast_mesh_arrays(mesh, face_varying_normals);
+    if (return_report)
+        return py::make_tuple(arrays, fast_report_to_dict(mesh));
+    return std::move(arrays);
 }
 
 void bind_tessellation(py::module_& m)
@@ -224,4 +379,60 @@ void bind_tessellation(py::module_& m)
         "    usd.export_mesh: Round-trip the mesh through USD.\n"
         "\n"
         "Wraps: SmApiTessellate");
+
+    m.def(
+        "tessellate_fast",
+        &smpy_tessellate_fast,
+        py::arg("brep"),
+        py::kw_only(),
+        py::arg("chord_height_tolerance") = SmTessellationDefaults::kChordHeightTol,
+        py::arg("curve_angle_tolerance_deg") = SmTessellationDefaults::kCurveAngleTolDeg,
+        py::arg("surface_angle_tolerance_deg") = SmTessellationDefaults::kSurfaceAngleTolDeg,
+        py::arg("max_edge_length") = SmTessellationDefaults::kMaxEdgeLength,
+        py::arg("max_aspect_ratio") = SmTessellationDefaults::kMaxAspectRatio,
+        py::arg("allow_partial") = false, py::arg("face_varying_normals") = false, py::arg("return_report") = false,
+        "Pure: returns new mesh arrays; inputs unchanged.\n"
+        "\n"
+        "Tessellate a Brep with the opt-in fast tessellator into mesh arrays.\n"
+        "\n"
+        "Args:\n"
+        "    brep: Source Brep. Not modified.\n"
+        "    chord_height_tolerance: As for ``tessellate``. Keyword-only.\n"
+        "    curve_angle_tolerance_deg: As for ``tessellate``. Keyword-only.\n"
+        "    surface_angle_tolerance_deg: As for ``tessellate``. Keyword-only.\n"
+        "    max_edge_length: As for ``tessellate``. Keyword-only.\n"
+        "    max_aspect_ratio: As for ``tessellate``. Keyword-only.\n"
+        "    allow_partial: Keep the other faces when some faces fail; the failed\n"
+        "        ones are listed in the report. Defaults to ``False`` (raise\n"
+        "        instead). Requires ``return_report=True``; otherwise raises\n"
+        "        ValueError. Keyword-only.\n"
+        "    face_varying_normals: Return one normal per triangle corner, the\n"
+        "        normal of its source face, instead of one averaged normal per\n"
+        "        vertex, as ``PolyBrep.to_mesh_arrays`` does. Keyword-only.\n"
+        "    return_report: Return ``(arrays, report)``. The report has\n"
+        "        ``face_ids`` (source face of each triangle, in ``faces()``\n"
+        "        order), ``face_kinds`` (per face: ``fast``, ``fallback`` or\n"
+        "        ``failed``), ``failed_faces`` and the count of each kind.\n"
+        "        Defaults to ``False``. Keyword-only.\n"
+        "\n"
+        "Returns:\n"
+        "    dict: The layout of ``PolyBrep.to_mesh_arrays``: ``points``,\n"
+        "    ``normals`` and ``face_normals`` as lists of 3-tuples of floats\n"
+        "    rounded to float32, and ``faces`` as a flat triangle stream\n"
+        "    ``[3, i0, i1, i2, 3, ...]``. ``(arrays, report)`` when\n"
+        "    ``return_report=True``.\n"
+        "\n"
+        "Notes:\n"
+        "    The fast tessellator keeps the edge tessellation and quality\n"
+        "    controls of ``tessellate``, triangulates faces in parallel, and\n"
+        "    triangulates the faces it cannot handle as ``tessellate`` does\n"
+        "    (``fallback`` in the report). Faces share the vertices of their\n"
+        "    common edges. The mesh is deterministic at any thread count but\n"
+        "    differs from ``tessellate``'s, which this does not change. The\n"
+        "    arrays are ordinary Python objects owned by the caller.\n"
+        "\n"
+        "See Also:\n"
+        "    tessellate: The reference tessellator, returning a PolyBrep.\n"
+        "\n"
+        "Wraps: SmApiTessellateFast");
 }
